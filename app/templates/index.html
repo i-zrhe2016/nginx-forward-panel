@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>nginx-forward-panel</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <div>
+          <p class="eyebrow">NGINX STREAM CONTROL</p>
+          <h1>nginx-forward-panel</h1>
+          <p class="hero-copy">
+            管理监听端口、查看每个端口的累计流量，并按时间、流量或设备连接数控制端口。
+          </p>
+        </div>
+        <div class="hero-meta">
+          <div class="meta-block">
+            <span>面板地址</span>
+            <strong>{{ panel_host }}:{{ panel_port }}</strong>
+          </div>
+          <div class="meta-block">
+            <span>nginx 状态</span>
+            <strong class="{{ 'ok' if nginx_running else 'bad' }}">{{ '运行中' if nginx_running else '未运行' }}</strong>
+          </div>
+          <div class="meta-block">
+            <span>时区</span>
+            <strong>{{ timezone_label }}</strong>
+          </div>
+        </div>
+      </section>
+
+      {% if message %}
+      <section class="banner {{ level }}">
+        {{ message }}
+      </section>
+      {% endif %}
+
+      <section class="stats-grid">
+        <article class="stat-card">
+          <span>运行中端口</span>
+          <strong>{{ summary.active_ports }}</strong>
+        </article>
+        <article class="stat-card">
+          <span>已过期端口</span>
+          <strong>{{ summary.expired_ports }}</strong>
+        </article>
+        <article class="stat-card">
+          <span>已达上限端口</span>
+          <strong>{{ summary.quota_ports }}</strong>
+        </article>
+        <article class="stat-card">
+          <span>累计入站流量</span>
+          <strong>{{ summary.total_bytes_received | human_bytes }}</strong>
+        </article>
+        <article class="stat-card">
+          <span>累计出站流量</span>
+          <strong>{{ summary.total_bytes_sent | human_bytes }}</strong>
+        </article>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>新增端口</h2>
+          <p>监听端口会直接在宿主机生效。到期时间留空表示不过期，流量上限留空表示不限流，设备连接数默认 2。</p>
+        </div>
+        <form class="editor-grid" method="post" action="{{ url_for('create_port') }}">
+          <label>
+            <span>监听端口</span>
+            <input type="number" name="listen_port" min="1" max="65535" required>
+          </label>
+          <label>
+            <span>目标主机</span>
+            <input type="text" name="upstream_host" value="{{ default_upstream_host }}" required>
+          </label>
+          <label>
+            <span>目标端口</span>
+            <input type="number" name="upstream_port" min="1" max="65535" value="{{ default_upstream_port }}" required>
+          </label>
+          <label>
+            <span>到期时间（{{ timezone_label }}）</span>
+            <input type="datetime-local" name="expires_at">
+          </label>
+          <label>
+            <span>流量上限</span>
+            <input type="text" name="traffic_limit" placeholder="例如 10G / 500MB / 1048576">
+          </label>
+          <label>
+            <span>设备连接数上限（同 IP 并发）</span>
+            <input type="number" name="device_limit" min="1" value="{{ default_device_limit }}" required>
+          </label>
+          <label class="full">
+            <span>备注</span>
+            <input type="text" name="note" maxlength="200" placeholder="例如：客户A / 北京节点 / 测试口">
+          </label>
+          <div class="actions">
+            <button class="primary" type="submit">创建端口</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="list-head">
+        <div>
+          <h2>端口列表</h2>
+          <p>共 {{ summary.total_ports }} 个端口，累计连接 {{ summary.total_connections }} 次。</p>
+        </div>
+      </section>
+
+      {% if ports %}
+        <section class="port-list">
+          {% for port in ports %}
+          <article class="port-card">
+            <div class="card-head">
+              <div>
+                <h3>{{ port.listen_port }}</h3>
+                <p>{{ port.upstream_host }}:{{ port.upstream_port }}</p>
+              </div>
+              <span class="badge {{ port.status }}">{{ port.status_label }}</span>
+            </div>
+
+            <div class="traffic-grid">
+              <div>
+                <span>累计入站</span>
+                <strong>{{ port.total_bytes_received | human_bytes }}</strong>
+              </div>
+              <div>
+                <span>累计出站</span>
+                <strong>{{ port.total_bytes_sent | human_bytes }}</strong>
+              </div>
+              <div>
+                <span>今日入站</span>
+                <strong>{{ port.today_bytes_received | human_bytes }}</strong>
+              </div>
+              <div>
+                <span>今日出站</span>
+                <strong>{{ port.today_bytes_sent | human_bytes }}</strong>
+              </div>
+              <div>
+                <span>累计连接</span>
+                <strong>{{ port.total_connections }}</strong>
+              </div>
+              <div>
+                <span>最后访问</span>
+                <strong>{{ port.last_seen_display }}</strong>
+              </div>
+            </div>
+
+            <form class="editor-grid compact" method="post" action="{{ url_for('update_port', port_id=port.id) }}">
+              <label>
+                <span>监听端口</span>
+                <input type="number" name="listen_port" min="1" max="65535" value="{{ port.listen_port }}" required>
+              </label>
+              <label>
+                <span>目标主机</span>
+                <input type="text" name="upstream_host" value="{{ port.upstream_host }}" required>
+              </label>
+              <label>
+                <span>目标端口</span>
+                <input type="number" name="upstream_port" min="1" max="65535" value="{{ port.upstream_port }}" required>
+              </label>
+              <label>
+                <span>到期时间（{{ timezone_label }}）</span>
+                <input type="datetime-local" name="expires_at" value="{{ port.expires_at_input }}">
+              </label>
+              <label>
+                <span>流量上限</span>
+                <input type="text" name="traffic_limit" value="{{ port.traffic_limit_input }}" placeholder="例如 10G / 500MB / 1048576">
+              </label>
+              <label>
+                <span>设备连接数上限（同 IP 并发）</span>
+                <input type="number" name="device_limit" min="1" value="{{ port.device_limit_input }}" required>
+              </label>
+              <label class="full">
+                <span>备注</span>
+                <input type="text" name="note" maxlength="200" value="{{ port.note }}">
+              </label>
+              <div class="actions split">
+                <button class="primary" type="submit">保存修改</button>
+              </div>
+            </form>
+
+            <div class="footer-actions">
+              <div class="meta-row">
+                <span>到期时间</span>
+                <strong>{{ port.expires_at_display }}</strong>
+              </div>
+              <div class="meta-row">
+                <span>流量上限</span>
+                <strong>{{ port.traffic_limit_display }}</strong>
+                {% if port.traffic_limit_bytes is not none %}
+                <span>已用 {{ port.traffic_used_display }}，剩余 {{ port.traffic_remaining_display }}</span>
+                {% endif %}
+              </div>
+              <div class="meta-row">
+                <span>设备连接数上限</span>
+                <strong>{{ port.device_limit }}</strong>
+                <span>按同一客户端 IP 并发连接数限制</span>
+              </div>
+              <div class="button-row">
+                {% if port.status == 'quota' %}
+                <form method="post" action="{{ url_for('reset_port_traffic', port_id=port.id) }}" onsubmit="return confirm('确认重置端口 {{ port.listen_port }} 的流量并重新启用吗？');">
+                  <button class="secondary" type="submit">重置流量并启用</button>
+                </form>
+                {% elif port.status == 'active' or port.status == 'disabled' %}
+                <form method="post" action="{{ url_for('toggle_port', port_id=port.id) }}">
+                  <button class="secondary" type="submit">
+                    {{ '停用端口' if port.status == 'active' else '启用端口' }}
+                  </button>
+                </form>
+                {% else %}
+                <button class="secondary" type="button" disabled>{{ port.status_label }}</button>
+                {% endif %}
+                <form method="post" action="{{ url_for('delete_port', port_id=port.id) }}" onsubmit="return confirm('确认删除端口 {{ port.listen_port }} 吗？');">
+                  <button class="danger" type="submit">删除端口</button>
+                </form>
+              </div>
+            </div>
+          </article>
+          {% endfor %}
+        </section>
+      {% else %}
+        <section class="empty-state">
+          当前还没有端口配置。
+        </section>
+      {% endif %}
+    </main>
+  </body>
+  </html>

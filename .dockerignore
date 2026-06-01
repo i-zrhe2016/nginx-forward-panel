@@ -1,0 +1,6 @@
+data
+logs
+backups
+__pycache__
+app/__pycache__
+app/static/.DS_Store

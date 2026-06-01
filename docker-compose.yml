@@ -1,0 +1,38 @@
+name: nginx-forward-panel
+
+services:
+  nginx-forward-panel:
+    build: .
+    container_name: nginx-forward-panel
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      PANEL_PORT: "18080"
+      DEFAULT_UPSTREAM_HOST: "nat.qq.pw"
+      DEFAULT_UPSTREAM_PORT: "31098"
+      SEED_LISTEN_PORT: "31098"
+      PANEL_USERNAME: ""
+      PANEL_PASSWORD: ""
+    volumes:
+      - ./data:/data
+      - ./logs:/var/log/nginx
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18080/healthz', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+  nginx-forward-panel-db-backup:
+    build: .
+    container_name: nginx-forward-panel-db-backup
+    restart: unless-stopped
+    command: ["sh", "/app/scripts/start-backup-cron.sh"]
+    environment:
+      DB_PATH: "/data/panel.db"
+      DB_BACKUP_DIR: "/backups"
+      DB_BACKUP_KEEP_DAYS: "7"
+      DB_BACKUP_PREFIX: "nginx-forward-panel"
+      DB_BACKUP_CRON_SCHEDULE: "0 3 * * *"
+    volumes:
+      - ./data:/data
+      - ./backups:/backups
+      - ./logs:/var/log
