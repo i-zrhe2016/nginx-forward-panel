@@ -3,6 +3,7 @@ import atexit
 import base64
 import os
 import re
+import socket
 import signal
 import sqlite3
 import subprocess
@@ -12,6 +13,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import Flask, Response, jsonify, redirect, render_template, request, url_for
+
+
+def parse_optional_env_port(value, field_name):
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        port = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} 必须是数字。") from exc
+    if port < 1 or port > 65535:
+        raise ValueError(f"{field_name} 必须在 1-65535 之间。")
+    return port
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -30,13 +44,23 @@ PANEL_PASSWORD = os.environ.get("PANEL_PASSWORD", "")
 
 DEFAULT_UPSTREAM_HOST = os.environ.get("DEFAULT_UPSTREAM_HOST", "nat.qq.pw")
 DEFAULT_UPSTREAM_PORT = int(os.environ.get("DEFAULT_UPSTREAM_PORT", "31098"))
-DEFAULT_DEVICE_LIMIT = 2
-DEVICE_LIMIT_ZONE_SIZE = "128k"
 SEED_LISTEN_PORT = os.environ.get("SEED_LISTEN_PORT", "31098").strip()
 PROXY_CONNECT_TIMEOUT = os.environ.get("PROXY_CONNECT_TIMEOUT", "5s")
 PROXY_TIMEOUT = os.environ.get("PROXY_TIMEOUT", "600s")
 MAINTENANCE_INTERVAL = int(os.environ.get("MAINTENANCE_INTERVAL", "10"))
+PROBE_ENABLED = os.environ.get("PROBE_ENABLED", "0").strip().lower() not in {"0", "false", "no", "off"}
+PROBE_INTERVAL = int(os.environ.get("PROBE_INTERVAL", "60"))
+PROBE_TIMEOUT = float(os.environ.get("PROBE_TIMEOUT", "3"))
+PROBE_TEST_LISTEN_PORT = parse_optional_env_port(
+    os.environ.get("PROBE_TEST_LISTEN_PORT", ""),
+    "PROBE_TEST_LISTEN_PORT",
+)
 AUTH_ENABLED = bool(PANEL_USERNAME or PANEL_PASSWORD)
+PROBE_DASHBOARD_RANGES = {
+    "1h": {"hours": 1, "label": "1小时"},
+    "24h": {"hours": 24, "label": "24小时"},
+    "7d": {"hours": 24 * 7, "label": "7天"},
+}
 
 HOST_PATTERN = re.compile(r"^(?:[A-Za-z0-9][A-Za-z0-9.-]*|\[[0-9A-Fa-f:]+\])$")
 LOCAL_TZ = datetime.now().astimezone().tzinfo or timezone.utc
@@ -122,19 +146,6 @@ def parse_data_size(value, field_name):
     return size
 
 
-def parse_device_limit(value):
-    raw = str(value or "").strip()
-    if not raw:
-        return DEFAULT_DEVICE_LIMIT
-    try:
-        limit = int(raw)
-    except ValueError as exc:
-        raise ValidationError("设备连接数上限必须是整数。") from exc
-    if limit < 1:
-        raise ValidationError("设备连接数上限必须大于 0。")
-    return limit
-
-
 def parse_expiry(value):
     raw = str(value or "").strip()
     if not raw:
@@ -175,6 +186,12 @@ def format_input_time(value):
         return ""
     dt = datetime.fromisoformat(value).astimezone(LOCAL_TZ)
     return dt.strftime("%Y-%m-%dT%H:%M")
+
+
+def localize_time(value):
+    if not value:
+        return None
+    return datetime.fromisoformat(value).astimezone(LOCAL_TZ)
 
 
 def status_payload(enabled, expires_at, traffic_limit_bytes=None, traffic_usage_bytes=0):
@@ -224,7 +241,6 @@ class PanelState:
                     upstream_port INTEGER NOT NULL,
                     expires_at TEXT,
                     traffic_limit_bytes INTEGER,
-                    device_limit INTEGER NOT NULL DEFAULT 2,
                     enabled INTEGER NOT NULL DEFAULT 1,
                     note TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
@@ -252,6 +268,21 @@ class PanelState:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS upstream_probes (
+                    listen_port INTEGER PRIMARY KEY,
+                    is_reachable INTEGER NOT NULL,
+                    checked_at TEXT NOT NULL,
+                    failure_reason TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE TABLE IF NOT EXISTS upstream_probe_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    listen_port INTEGER NOT NULL,
+                    is_reachable INTEGER NOT NULL,
+                    checked_at TEXT NOT NULL,
+                    failure_reason TEXT NOT NULL DEFAULT ''
+                );
                 """
             )
             self.ensure_port_schema(conn)
@@ -263,14 +294,6 @@ class PanelState:
         }
         if "traffic_limit_bytes" not in columns:
             conn.execute("ALTER TABLE ports ADD COLUMN traffic_limit_bytes INTEGER")
-        if "device_limit" not in columns:
-            conn.execute(
-                f"ALTER TABLE ports ADD COLUMN device_limit INTEGER NOT NULL DEFAULT {DEFAULT_DEVICE_LIMIT}"
-            )
-        conn.execute(
-            "UPDATE ports SET device_limit = ? WHERE device_limit IS NULL OR device_limit < 1",
-            (DEFAULT_DEVICE_LIMIT,),
-        )
 
     def seed_defaults(self):
         if not SEED_LISTEN_PORT:
@@ -284,14 +307,13 @@ class PanelState:
             conn.execute(
                 """
                 INSERT INTO ports (
-                    listen_port, upstream_host, upstream_port, expires_at, device_limit, enabled, note, created_at, updated_at
-                ) VALUES (?, ?, ?, NULL, ?, 1, ?, ?, ?)
+                    listen_port, upstream_host, upstream_port, expires_at, enabled, note, created_at, updated_at
+                ) VALUES (?, ?, ?, NULL, 1, ?, ?, ?)
                 """,
                 (
                     listen_port,
                     DEFAULT_UPSTREAM_HOST,
                     DEFAULT_UPSTREAM_PORT,
-                    DEFAULT_DEVICE_LIMIT,
                     "默认初始化端口",
                     now,
                     now,
@@ -434,11 +456,15 @@ class PanelState:
                     COALESCE(t.total_bytes_sent, 0) AS total_bytes_sent,
                     COALESCE(t.total_bytes_received, 0) AS total_bytes_received,
                     t.last_seen AS last_seen,
+                    pr.is_reachable AS probe_is_reachable,
+                    pr.checked_at AS probe_checked_at,
+                    pr.failure_reason AS probe_failure_reason,
                     COALESCE(d.total_connections, 0) AS today_connections,
                     COALESCE(d.total_bytes_sent, 0) AS today_bytes_sent,
                     COALESCE(d.total_bytes_received, 0) AS today_bytes_received
                 FROM ports p
                 LEFT JOIN traffic_totals t ON t.listen_port = p.listen_port
+                LEFT JOIN upstream_probes pr ON pr.listen_port = p.listen_port
                 LEFT JOIN traffic_daily d ON d.listen_port = p.listen_port AND d.stat_date = ?
                 ORDER BY p.listen_port ASC
                 """,
@@ -451,6 +477,19 @@ class PanelState:
             item["expires_at_display"] = format_display_time(item["expires_at"])
             item["expires_at_input"] = format_input_time(item["expires_at"])
             item["last_seen_display"] = format_display_time(item["last_seen"]) if item["last_seen"] else "暂无"
+            item["probe_checked_at_display"] = (
+                format_display_time(item["probe_checked_at"]) if item["probe_checked_at"] else "暂无"
+            )
+            item["probe_status"] = "unknown"
+            item["probe_status_label"] = "未检测"
+            item["probe_failure_reason"] = item["probe_failure_reason"] or ""
+            if item["probe_is_reachable"] is not None:
+                if int(item["probe_is_reachable"]):
+                    item["probe_status"] = "healthy"
+                    item["probe_status_label"] = "后端可达"
+                else:
+                    item["probe_status"] = "unhealthy"
+                    item["probe_status_label"] = "后端不可达"
             item["traffic_usage_bytes"] = int(item["total_bytes_sent"]) + int(item["total_bytes_received"])
             item["traffic_limit_display"] = (
                 human_bytes(item["traffic_limit_bytes"]) if item["traffic_limit_bytes"] is not None else "无限制"
@@ -458,7 +497,6 @@ class PanelState:
             item["traffic_limit_input"] = (
                 human_bytes(item["traffic_limit_bytes"]) if item["traffic_limit_bytes"] is not None else ""
             )
-            item["device_limit_input"] = int(item["device_limit"] or DEFAULT_DEVICE_LIMIT)
             item["traffic_used_display"] = human_bytes(item["traffic_usage_bytes"])
             if item["traffic_limit_bytes"] is None:
                 item["traffic_remaining_display"] = "无限制"
@@ -509,7 +547,6 @@ class PanelState:
             "upstream_port": parse_port(form.get("upstream_port"), "目标端口"),
             "expires_at": parse_expiry(form.get("expires_at")),
             "traffic_limit_bytes": parse_data_size(form.get("traffic_limit"), "流量上限"),
-            "device_limit": parse_device_limit(form.get("device_limit")),
             "note": parse_note(form.get("note")),
         }
 
@@ -519,8 +556,8 @@ class PanelState:
             conn.execute(
                 """
                 INSERT INTO ports (
-                    listen_port, upstream_host, upstream_port, expires_at, traffic_limit_bytes, device_limit, enabled, note, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                    listen_port, upstream_host, upstream_port, expires_at, traffic_limit_bytes, enabled, note, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
                 """,
                 (
                     payload["listen_port"],
@@ -528,7 +565,6 @@ class PanelState:
                     payload["upstream_port"],
                     payload["expires_at"],
                     payload["traffic_limit_bytes"],
-                    payload["device_limit"],
                     payload["note"],
                     now,
                     now,
@@ -546,7 +582,7 @@ class PanelState:
             conn.execute(
                 """
                 UPDATE ports
-                SET listen_port = ?, upstream_host = ?, upstream_port = ?, expires_at = ?, traffic_limit_bytes = ?, device_limit = ?, note = ?, updated_at = ?
+                SET listen_port = ?, upstream_host = ?, upstream_port = ?, expires_at = ?, traffic_limit_bytes = ?, note = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -555,7 +591,6 @@ class PanelState:
                     payload["upstream_port"],
                     payload["expires_at"],
                     payload["traffic_limit_bytes"],
-                    payload["device_limit"],
                     payload["note"],
                     now,
                     port_id,
@@ -602,6 +637,204 @@ class PanelState:
 
     def disable_expired_ports(self, reload_nginx=True):
         return self.disable_auto_stopped_ports(reload_nginx=reload_nginx)
+
+    def run_upstream_probes(self):
+        if not PROBE_ENABLED:
+            return 0
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT listen_port, upstream_host, upstream_port
+                FROM ports
+                ORDER BY listen_port ASC
+                """
+            ).fetchall()
+
+        results = []
+        for row in rows:
+            checked_at = utc_iso_now()
+            reachable = 0
+            failure_reason = ""
+            try:
+                with socket.create_connection(
+                    (row["upstream_host"], int(row["upstream_port"])),
+                    timeout=PROBE_TIMEOUT,
+                ):
+                    reachable = 1
+            except OSError as exc:
+                failure_reason = str(exc)[:200]
+            results.append((row["listen_port"], reachable, checked_at, failure_reason))
+
+        with self.write_lock:
+            with self.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                for item in results:
+                    conn.execute(
+                        """
+                        INSERT INTO upstream_probes (listen_port, is_reachable, checked_at, failure_reason)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(listen_port) DO UPDATE SET
+                            is_reachable = excluded.is_reachable,
+                            checked_at = excluded.checked_at,
+                            failure_reason = excluded.failure_reason
+                        """,
+                        item,
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO upstream_probe_history (
+                            listen_port, is_reachable, checked_at, failure_reason
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        item,
+                    )
+                cutoff = (
+                    datetime.now(timezone.utc).timestamp() - 7 * 24 * 3600
+                )
+                conn.execute(
+                    """
+                    DELETE FROM upstream_probe_history
+                    WHERE strftime('%s', checked_at) < ?
+                    """,
+                    (int(cutoff),),
+                )
+                conn.commit()
+        return len(results)
+
+    def get_probe_dashboard(self, range_key):
+        active_range_key = range_key if range_key in PROBE_DASHBOARD_RANGES else "24h"
+        active_range = PROBE_DASHBOARD_RANGES[active_range_key]
+        since_dt = utc_now().timestamp() - active_range["hours"] * 3600
+        with self.connect() as conn:
+            if PROBE_TEST_LISTEN_PORT is not None:
+                test_port = conn.execute(
+                    """
+                    SELECT listen_port, upstream_host, upstream_port, note, enabled
+                    FROM ports
+                    WHERE listen_port = ?
+                    LIMIT 1
+                    """,
+                    (PROBE_TEST_LISTEN_PORT,),
+                ).fetchone()
+            else:
+                test_port = conn.execute(
+                    """
+                    SELECT listen_port, upstream_host, upstream_port, note, enabled
+                    FROM ports
+                    WHERE enabled = 1
+                    ORDER BY listen_port ASC
+                    LIMIT 1
+                    """
+                ).fetchone()
+            if test_port is None:
+                return {
+                    "test_port": None,
+                    "summary": None,
+                    "chart_points": [],
+                    "recent_checks": [],
+                    "requested_test_port": PROBE_TEST_LISTEN_PORT,
+                    "range_key": active_range_key,
+                    "range_label": active_range["label"],
+                    "range_options": self.probe_dashboard_range_options(active_range_key),
+                }
+
+            history_rows = conn.execute(
+                """
+                SELECT is_reachable, checked_at, failure_reason
+                FROM upstream_probe_history
+                WHERE listen_port = ?
+                ORDER BY checked_at DESC
+                LIMIT 300
+                """,
+                (test_port["listen_port"],),
+            ).fetchall()
+
+        filtered_rows = []
+        for row in history_rows:
+            checked_local = localize_time(row["checked_at"])
+            if checked_local is None:
+                continue
+            if checked_local.timestamp() >= since_dt:
+                filtered_rows.append(row)
+
+        history = list(reversed(filtered_rows[:120]))
+        chart_points = []
+        healthy_count = 0
+        unhealthy_count = 0
+        last_success = None
+        last_failure = None
+        for index, row in enumerate(history):
+            checked_local = localize_time(row["checked_at"])
+            is_reachable = bool(row["is_reachable"])
+            if is_reachable:
+                healthy_count += 1
+                last_success = checked_local
+            else:
+                unhealthy_count += 1
+                last_failure = checked_local
+            chart_points.append(
+                {
+                    "x": index,
+                    "y": 1 if is_reachable else 0,
+                    "label": checked_local.strftime("%m-%d %H:%M:%S") if checked_local else "",
+                    "status": "healthy" if is_reachable else "unhealthy",
+                }
+            )
+
+        recent_checks = []
+        for row in filtered_rows[:12]:
+            checked_local = localize_time(row["checked_at"])
+            recent_checks.append(
+                {
+                    "status": "healthy" if row["is_reachable"] else "unhealthy",
+                    "status_label": "可达" if row["is_reachable"] else "不可达",
+                    "checked_at_display": checked_local.strftime("%Y-%m-%d %H:%M:%S") if checked_local else "暂无",
+                    "failure_reason": row["failure_reason"] or "",
+                }
+            )
+
+        total_checks = healthy_count + unhealthy_count
+        uptime_ratio = (healthy_count / total_checks * 100) if total_checks else 0.0
+        current_status = "unknown"
+        current_status_label = "未检测"
+        if filtered_rows:
+            current_status = "healthy" if filtered_rows[0]["is_reachable"] else "unhealthy"
+            current_status_label = "后端可达" if filtered_rows[0]["is_reachable"] else "后端不可达"
+
+        return {
+            "test_port": {
+                "listen_port": test_port["listen_port"],
+                "fixed": PROBE_TEST_LISTEN_PORT is not None,
+                "enabled": bool(test_port["enabled"]),
+            },
+            "summary": {
+                "current_status": current_status,
+                "current_status_label": current_status_label,
+                "total_checks": total_checks,
+                "healthy_count": healthy_count,
+                "unhealthy_count": unhealthy_count,
+                "uptime_ratio": f"{uptime_ratio:.1f}",
+                "last_success_display": last_success.strftime("%Y-%m-%d %H:%M:%S") if last_success else "暂无",
+                "last_failure_display": last_failure.strftime("%Y-%m-%d %H:%M:%S") if last_failure else "暂无",
+            },
+            "chart_points": chart_points,
+            "recent_checks": recent_checks,
+            "requested_test_port": PROBE_TEST_LISTEN_PORT,
+            "range_key": active_range_key,
+            "range_label": active_range["label"],
+            "range_options": self.probe_dashboard_range_options(active_range_key),
+        }
+
+    def probe_dashboard_range_options(self, active_range_key):
+        return [
+            {
+                "key": key,
+                "label": config["label"],
+                "active": key == active_range_key,
+            }
+            for key, config in PROBE_DASHBOARD_RANGES.items()
+        ]
 
     def disable_auto_stopped_ports(self, reload_nginx=True):
         with self.write_lock:
@@ -768,8 +1001,7 @@ class PanelState:
             SELECT
                 p.listen_port,
                 p.upstream_host,
-                p.upstream_port,
-                p.device_limit
+                p.upstream_port
             FROM ports
             AS p
             LEFT JOIN traffic_totals t ON t.listen_port = p.listen_port
@@ -789,19 +1021,10 @@ class PanelState:
             "",
         ]
         for row in rows:
-            zone_name = f"port_{row['listen_port']}_devices"
-            blocks.append(
-                f"limit_conn_zone $binary_remote_addr zone={zone_name}:{DEVICE_LIMIT_ZONE_SIZE};"
-            )
-        if rows:
-            blocks.append("")
-        for row in rows:
-            zone_name = f"port_{row['listen_port']}_devices"
             blocks.extend(
                 [
                     "server {",
                     f"    listen {row['listen_port']} reuseport;",
-                    f"    limit_conn {zone_name} {row['device_limit']};",
                     f"    proxy_connect_timeout {PROXY_CONNECT_TIMEOUT};",
                     f"    proxy_timeout {PROXY_TIMEOUT};",
                     f"    proxy_pass {row['upstream_host']}:{row['upstream_port']};",
@@ -854,10 +1077,15 @@ class PanelState:
         raise RuntimeError(f"{error_prefix}: {detail}")
 
     def maintenance_loop(self):
+        last_probe_at = 0.0
         while not self.stop_event.wait(MAINTENANCE_INTERVAL):
             try:
                 self.sync_traffic_logs()
                 self.disable_auto_stopped_ports(reload_nginx=True)
+                now_monotonic = time.monotonic()
+                if PROBE_ENABLED and now_monotonic - last_probe_at >= PROBE_INTERVAL:
+                    self.run_upstream_probes()
+                    last_probe_at = now_monotonic
             except Exception:
                 continue
 
@@ -911,10 +1139,26 @@ def index():
         summary=summary,
         default_upstream_host=DEFAULT_UPSTREAM_HOST,
         default_upstream_port=DEFAULT_UPSTREAM_PORT,
-        default_device_limit=DEFAULT_DEVICE_LIMIT,
         timezone_label=datetime.now().astimezone().strftime("%Z"),
         message=request.args.get("message", "").strip(),
         level=request.args.get("level", "info").strip(),
+        nginx_running=state.nginx_running(),
+        panel_host=PANEL_HOST,
+        panel_port=PANEL_PORT,
+        probe_enabled=PROBE_ENABLED,
+    )
+
+
+@app.route("/probe-dashboard", methods=["GET"])
+def probe_dashboard():
+    if not PROBE_ENABLED:
+        return redirect(url_for("index", message="探针检测已停用。", level="info"), code=303)
+    state.sync_traffic_logs()
+    dashboard = state.get_probe_dashboard(request.args.get("range", "24h").strip())
+    return render_template(
+        "probe_dashboard.html",
+        dashboard=dashboard,
+        timezone_label=datetime.now().astimezone().strftime("%Z"),
         nginx_running=state.nginx_running(),
         panel_host=PANEL_HOST,
         panel_port=PANEL_PORT,

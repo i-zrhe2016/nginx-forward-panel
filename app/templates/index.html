@@ -13,7 +13,7 @@
           <p class="eyebrow">NGINX STREAM CONTROL</p>
           <h1>nginx-forward-panel</h1>
           <p class="hero-copy">
-            管理监听端口、查看每个端口的累计流量，并按时间、流量或设备连接数控制端口。
+            管理监听端口、查看每个端口的累计流量，并按时间或流量控制端口。
           </p>
         </div>
         <div class="hero-meta">
@@ -29,6 +29,12 @@
             <span>时区</span>
             <strong>{{ timezone_label }}</strong>
           </div>
+          {% if probe_enabled %}
+          <div class="meta-block">
+            <span>探针监控</span>
+            <strong><a class="meta-link" href="{{ url_for('probe_dashboard') }}">进入监控页</a></strong>
+          </div>
+          {% endif %}
         </div>
       </section>
 
@@ -64,7 +70,7 @@
       <section class="panel">
         <div class="panel-head">
           <h2>新增端口</h2>
-          <p>监听端口会直接在宿主机生效。到期时间留空表示不过期，流量上限留空表示不限流，设备连接数默认 2。</p>
+          <p>监听端口会直接在宿主机生效。到期时间留空表示不过期，流量上限留空表示不限流。</p>
         </div>
         <form class="editor-grid" method="post" action="{{ url_for('create_port') }}">
           <label>
@@ -87,10 +93,6 @@
             <span>流量上限</span>
             <input type="text" name="traffic_limit" placeholder="例如 10G / 500MB / 1048576">
           </label>
-          <label>
-            <span>设备连接数上限（同 IP 并发）</span>
-            <input type="number" name="device_limit" min="1" value="{{ default_device_limit }}" required>
-          </label>
           <label class="full">
             <span>备注</span>
             <input type="text" name="note" maxlength="200" placeholder="例如：客户A / 北京节点 / 测试口">
@@ -106,6 +108,11 @@
           <h2>端口列表</h2>
           <p>共 {{ summary.total_ports }} 个端口，累计连接 {{ summary.total_connections }} 次。</p>
         </div>
+        {% if probe_enabled %}
+        <div class="head-actions">
+          <a class="link-pill" href="{{ url_for('probe_dashboard') }}">打开探针监控页</a>
+        </div>
+        {% endif %}
       </section>
 
       {% if ports %}
@@ -145,6 +152,16 @@
                 <span>最后访问</span>
                 <strong>{{ port.last_seen_display }}</strong>
               </div>
+              {% if probe_enabled %}
+              <div>
+                <span>后端探针</span>
+                <strong class="probe-text {{ port.probe_status }}">{{ port.probe_status_label }}</strong>
+              </div>
+              <div>
+                <span>最近检测</span>
+                <strong>{{ port.probe_checked_at_display }}</strong>
+              </div>
+              {% endif %}
             </div>
 
             <form class="editor-grid compact" method="post" action="{{ url_for('update_port', port_id=port.id) }}">
@@ -168,10 +185,6 @@
                 <span>流量上限</span>
                 <input type="text" name="traffic_limit" value="{{ port.traffic_limit_input }}" placeholder="例如 10G / 500MB / 1048576">
               </label>
-              <label>
-                <span>设备连接数上限（同 IP 并发）</span>
-                <input type="number" name="device_limit" min="1" value="{{ port.device_limit_input }}" required>
-              </label>
               <label class="full">
                 <span>备注</span>
                 <input type="text" name="note" maxlength="200" value="{{ port.note }}">
@@ -193,11 +206,17 @@
                 <span>已用 {{ port.traffic_used_display }}，剩余 {{ port.traffic_remaining_display }}</span>
                 {% endif %}
               </div>
+              {% if probe_enabled %}
               <div class="meta-row">
-                <span>设备连接数上限</span>
-                <strong>{{ port.device_limit }}</strong>
-                <span>按同一客户端 IP 并发连接数限制</span>
+                <span>后端连通性</span>
+                <strong class="probe-text {{ port.probe_status }}">{{ port.probe_status_label }}</strong>
+                {% if port.probe_failure_reason %}
+                <span>{{ port.probe_failure_reason }}</span>
+                {% else %}
+                <span>最后检测时间：{{ port.probe_checked_at_display }}</span>
+                {% endif %}
               </div>
+              {% endif %}
               <div class="button-row">
                 {% if port.status == 'quota' %}
                 <form method="post" action="{{ url_for('reset_port_traffic', port_id=port.id) }}" onsubmit="return confirm('确认重置端口 {{ port.listen_port }} 的流量并重新启用吗？');">

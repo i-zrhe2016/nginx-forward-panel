@@ -13,6 +13,9 @@ services:
       SEED_LISTEN_PORT: "31098"
       PANEL_USERNAME: ""
       PANEL_PASSWORD: ""
+      PROBE_ENABLED: "1"
+      PROBE_INTERVAL: "180"
+      PROBE_TEST_LISTEN_PORT: "31098"
     volumes:
       - ./data:/data
       - ./logs:/var/log/nginx

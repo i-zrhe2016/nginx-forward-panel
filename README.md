@@ -8,7 +8,6 @@
 - 将多个入口端口转发到固定上游
 - 按到期时间自动停用端口
 - 按累计流量上限自动停用端口
-- 按同一客户端 IP 的并发连接数限制设备连接，默认 2
 - 在网页里查看每个端口的累计连接数和流量
 
 项目当前不是通用的 V2Ray 面板。根服务是一个 Nginx `stream` 转发管理器；历史上的 `dimt_v2/` 配置和测试资料属于本地敏感材料，不随公开仓库分发。
@@ -23,7 +22,6 @@
 - 支持端口到期自动停用
 - 支持流量上限自动停用
 - 已达流量上限的端口支持重置流量并恢复启用
-- 支持设备连接数上限，默认 2
 - 解析 `stream-access.log`，统计总连接数、总流量、今日流量、最后访问时间
 - 首次启动可自动写入一个默认端口
 - SQLite 数据库支持定时备份
@@ -42,11 +40,8 @@
 每条端口规则最终会生成类似下面的 Nginx `stream` 配置：
 
 ```nginx
-limit_conn_zone $binary_remote_addr zone=port_31098_devices:128k;
-
 server {
     listen 31098 reuseport;
-    limit_conn port_31098_devices 2;
     proxy_connect_timeout 5s;
     proxy_timeout 600s;
     proxy_pass example.com:443;
@@ -91,7 +86,6 @@ docker compose logs -f
 - 设置转发目标主机和目标端口
 - 设置到期时间
 - 设置流量上限，例如 `10G`、`500MB`、`1048576`
-- 设置设备连接数上限，默认 `2`
 - 编辑备注
 - 手动启用或停用端口
 - 删除端口
@@ -102,12 +96,6 @@ docker compose logs -f
 - `已停用`：手动停用
 - `已过期`：到达过期时间后自动停用
 - `已达流量上限`：累计收发流量超过上限后自动停用
-
-设备连接数限制说明：
-
-- 当前实现基于 Nginx `limit_conn`
-- 限制维度是“同一客户端 IP 的并发连接数”
-- 每个端口默认限制为 `2`
 
 流量重置说明：
 
@@ -131,6 +119,10 @@ docker compose logs -f
 | `PROXY_CONNECT_TIMEOUT` | `5s` | Nginx `proxy_connect_timeout` |
 | `PROXY_TIMEOUT` | `600s` | Nginx `proxy_timeout` |
 | `MAINTENANCE_INTERVAL` | `10` | 后台维护线程扫描日志和自动停用的间隔，单位秒 |
+| `PROBE_ENABLED` | `0` | 是否启用后端连通性探针，默认关闭，设为 `1` 可恢复 |
+| `PROBE_INTERVAL` | `60` | 探针执行间隔，单位秒 |
+| `PROBE_TIMEOUT` | `3` | 单次 TCP 探针超时，单位秒 |
+| `PROBE_TEST_LISTEN_PORT` | 空 | 探针监控页固定使用的测试端口；在当前 `docker-compose.yml` 中示例固定为 `31098`，留空时自动选第一条已启用端口 |
 | `DATA_DIR` | `/data` | 数据目录 |
 | `DB_PATH` | `/data/panel.db` | SQLite 数据库路径 |
 | `DB_BACKUP_DIR` | `/backups` | SQLite 备份输出目录 |

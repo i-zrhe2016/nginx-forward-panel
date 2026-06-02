@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>探针监控 - nginx-forward-panel</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <div>
+          <p class="eyebrow">PROBE DASHBOARD</p>
+          <h1>后端连通性监控</h1>
+          <p class="hero-copy">
+            这个页面只盯一条内部测试链路。若它连通，通常可说明整组同上游转发服务没有明显故障。
+          </p>
+        </div>
+        <div class="hero-meta">
+          <div class="meta-block">
+            <span>面板地址</span>
+            <strong>{{ panel_host }}:{{ panel_port }}</strong>
+          </div>
+          <div class="meta-block">
+            <span>nginx 状态</span>
+            <strong class="{{ 'ok' if nginx_running else 'bad' }}">{{ '运行中' if nginx_running else '未运行' }}</strong>
+          </div>
+          <div class="meta-block">
+            <span>时区</span>
+            <strong>{{ timezone_label }}</strong>
+          </div>
+        </div>
+      </section>
+
+      {% if dashboard.test_port %}
+      <section class="list-head">
+        <div>
+          <h2>时间范围</h2>
+          <p>当前展示 {{ dashboard.range_label }} 内测试端口 {{ dashboard.test_port.listen_port }} 的探针结果。</p>
+        </div>
+        <div class="head-actions">
+          {% for option in dashboard.range_options %}
+          <a class="filter-pill {% if option.active %}active{% endif %}" href="{{ url_for('probe_dashboard', range=option.key) }}">{{ option.label }}</a>
+          {% endfor %}
+        </div>
+      </section>
+
+      <section class="stats-grid">
+        <article class="stat-card">
+          <span>测试端口</span>
+          <strong>{{ dashboard.test_port.listen_port }}</strong>
+        </article>
+        <article class="stat-card">
+          <span>当前状态</span>
+          <strong class="probe-text {{ dashboard.summary.current_status }}">{{ dashboard.summary.current_status_label }}</strong>
+        </article>
+        <article class="stat-card">
+          <span>成功率</span>
+          <strong>{{ dashboard.summary.uptime_ratio }}%</strong>
+        </article>
+        <article class="stat-card">
+          <span>检测总数</span>
+          <strong>{{ dashboard.summary.total_checks }}</strong>
+        </article>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>成功率概览</h2>
+          <p>当前固定测试端口为 {{ dashboard.test_port.listen_port }}。不展示具体后端目标，仅观察这条测试链路的连通性。当前窗口：{{ dashboard.range_label }}。</p>
+        </div>
+        <div class="uptime-hero">
+          <div class="uptime-ring">
+            <div class="uptime-ring-fill" style="--uptime: {{ dashboard.summary.uptime_ratio }}%;">
+              <div class="uptime-ring-core">
+                <span>成功率</span>
+                <strong>{{ dashboard.summary.uptime_ratio }}%</strong>
+              </div>
+            </div>
+          </div>
+          <div class="uptime-meta">
+            <div class="meta-block">
+              <span>成功次数</span>
+              <strong>{{ dashboard.summary.healthy_count }}</strong>
+            </div>
+            <div class="meta-block">
+              <span>失败次数</span>
+              <strong>{{ dashboard.summary.unhealthy_count }}</strong>
+            </div>
+            <div class="meta-block">
+              <span>最近成功</span>
+              <strong>{{ dashboard.summary.last_success_display }}</strong>
+            </div>
+            <div class="meta-block">
+              <span>最近失败</span>
+              <strong>{{ dashboard.summary.last_failure_display }}</strong>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>状态时间线</h2>
+          <p>绿色表示可达，红色表示失败，按时间从左到右排列。</p>
+        </div>
+        {% if dashboard.chart_points %}
+        <div class="timeline-shell">
+          <div class="timeline-track">
+            {% for point in dashboard.chart_points %}
+            <div class="timeline-segment {{ point.status }}">
+              <div class="timeline-tip">
+                <strong>{{ '可达' if point.status == 'healthy' else '不可达' }}</strong>
+                <span>{{ point.label }}</span>
+              </div>
+            </div>
+            {% endfor %}
+          </div>
+          <div class="chart-legend">
+            <span><i class="legend-dot healthy"></i> 可达</span>
+            <span><i class="legend-dot unhealthy"></i> 不可达</span>
+          </div>
+        </div>
+        {% else %}
+        <div class="empty-state">暂无探针历史，等待下一轮检测。</div>
+        {% endif %}
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>最近检测记录</h2>
+          <p>展示当前时间窗口内最近 12 次针对内部探针的结果和错误原因。</p>
+        </div>
+        <div class="probe-log">
+          {% for item in dashboard.recent_checks %}
+          <article class="probe-log-item">
+            <div>
+              <strong class="probe-text {{ item.status }}">{{ item.status_label }}</strong>
+              <span>{{ item.checked_at_display }}</span>
+            </div>
+            <div>
+              <span>{{ item.failure_reason if item.failure_reason else '连接成功' }}</span>
+            </div>
+          </article>
+          {% endfor %}
+        </div>
+      </section>
+      {% else %}
+      <section class="empty-state">
+        {% if dashboard.requested_test_port %}
+        已配置固定测试端口 {{ dashboard.requested_test_port }}，但当前没有对应端口配置。
+        {% else %}
+        当前没有可用的已启用端口，无法生成测试监控页。
+        {% endif %}
+      </section>
+      {% endif %}
+    </main>
+  </body>
+  </html>
