@@ -1,152 +1,207 @@
 # nginx-forward-panel
 
-`nginx-forward-panel` 是一个基于 `Flask + Nginx stream` 的轻量面板，用来在宿主机上动态管理 TCP 端口转发规则。
+`nginx-forward-panel` 当前更适合被理解成一套“AI routing 控制面 + Xray REALITY 数据面”的组合部署，而不只是一个 TCP 端口面板。
 
-它适合这类场景：
+这套仓库里的核心链路是：
 
-- 给不同客户或不同用途临时开独立端口
-- 将多个入口端口转发到固定上游
-- 按到期时间自动停用端口
-- 按累计流量上限自动停用端口
-- 在网页里查看每个端口的累计连接数和流量
+- `nginx-forward-panel` 用 Nginx `stream` 管理入口端口，把公网 TCP 入口稳定转发到本机 Xray
+- `xray-reality` 负责实际代理连接和路由命中
+- `xray-ai-domain-manager` 按小时分析 Xray 访问日志，识别 AI 域名并生成动态路由片段
+- 命中的 AI 域名自动改走 `AI_UPSTREAM_HOST:AI_UPSTREAM_PORT`
+- 面板数据库 `data/panel.db` 同时保存端口规则、流量统计和 AI 域名聚合结果
 
-项目当前不是通用的 V2Ray 面板。根服务是一个 Nginx `stream` 转发管理器；历史上的旧 V2 配置和测试资料属于本地敏感材料，不随公开仓库分发。
+如果不启用 `xray` profile，它仍然可以单独作为轻量 TCP 转发面板使用；但仓库当前最有价值的部分，是这条基于真实访问日志做动态 AI 分流的链路。
 
-## 功能特性
+## AI Routing 能做什么
 
-- Web 面板增删改查端口转发规则
-- 规则变更后自动生成 Nginx `stream` 配置并校验
-- Nginx 配置校验通过后自动 reload
-- 支持 Basic Auth 面板登录保护
-- 支持端口备注
-- 支持按端口生成 `V2Ray / Clash` 订阅链接，并可重新生成订阅路径
-- 与 `deploy/xray-reality` 联动时，可定时把 AI 域名识别结果写入共享 `panel.db`
-- 支持端口到期自动停用
-- 支持流量上限自动停用
-- 已达流量上限的端口支持重置流量并恢复启用
-- 解析 `stream-access.log`，统计总连接数、总流量、今日流量、最后访问时间
-- 支持可选的后端 TCP 连通性探针和独立探针监控页
-- 首次启动可自动写入一个默认端口
-- SQLite 数据库支持定时备份
+- 按真实访问域名把 AI 流量和普通流量分开处理
+- 优先使用本机 `codex` 分类未知域名，必要时回退到 OpenAI Responses API
+- 把 AI 域名分类结果缓存到 `runtime/ai-domain-decisions.json`
+- 把可直接注入 Xray 的动态规则写到 `runtime/dynamic-routing.json`
+- 在共享 `panel.db` 中维护 `ai_domains`、`ai_domain_observations`，方便面板和脚本复用
+- 输出按小时归档的文本和 JSON 报告，便于审计最近一小时命中了哪些 AI 域名
+- 仍然保留面板原有的端口管理、订阅链接、流量统计、到期停用和备份能力
+
+## 适合场景
+
+- 你有一个固定入口端口，希望把 AI 相关目标站点自动切到专用上游
+- 你想根据真实访问日志持续收敛 AI 域名名单，而不是手工维护一长串规则
+- 你想优先依赖本机 Codex 做分类，只在需要时才使用 OpenAI API
+- 你仍然需要一个简单的 Web 面板来管理入口端口、订阅链接和流量上限
 
 ## 适用边界
 
-当前这套面板更适合做“单一固定上游”的 TCP 入口管理，使用上有几个明确边界：
+- AI routing 只有在 `docker compose --profile xray ...` 启动后才会生效
+- 当前只处理 TCP 链路，不做 HTTP 反代，不做 UDP 分流
+- 面板本身仍是“单一固定上游”的 `stream` 管理器；AI 分流发生在后面的 Xray 路由层
+- 域名分类是按窗口批处理，默认每 `3600` 秒统计最近 `3600` 秒访问，不是逐请求实时判定
+- 没有本机 `codex` 且没有 `OPENAI_API_KEY` 时，只有内建已知 AI 域名会被自动识别，其他未知域名不会自动标成 AI
 
-- 当前只管理 TCP `stream` 转发，不处理 HTTP 反代，也不处理 UDP
-- 面板里新增和编辑端口时，后端目标固定为统一的 `DEFAULT_UPSTREAM_HOST:DEFAULT_UPSTREAM_PORT`
-- 根目录 `docker-compose.yml` 默认只启动面板和数据库备份；加上 `--profile xray` 时才会额外启动 `xray-reality` 和 `xray-ai-domain-manager`
+## AI Routing 工作原理
 
-## 工作原理
+默认链路可以概括成：
 
-应用启动后会做几件事：
-
-1. 初始化 SQLite 数据库
-2. 根据数据库里的启用端口生成 `/etc/nginx/streams-enabled/ports.conf`
-3. 执行 `nginx -t`
-4. 启动 Nginx
-5. 后台定时扫描访问日志并同步流量统计
-6. 对已过期或已超流量上限的端口自动停用并 reload Nginx
-
-每条端口规则最终会生成类似下面的 Nginx `stream` 配置：
-
-```nginx
-server {
-    listen 31098 reuseport;
-    proxy_connect_timeout 5s;
-    proxy_timeout 600s;
-    proxy_pass 127.0.0.1:443;
-}
+```text
+client
+  -> nginx stream listen port
+  -> local xray-reality
+  -> access.log
+  -> xray-ai-domain-manager
+  -> codex / openai classify
+  -> dynamic-routing.json
+  -> AI domains => ai_proxy
+  -> other domains => default route
 ```
 
-## 快速启动
+运行时主要步骤如下：
 
-推荐直接使用 Docker Compose。
+1. 面板根据 `ports` 表生成 Nginx `stream` 配置，把入口端口转到统一上游，默认是本机 `127.0.0.1:443`
+2. `xray-reality` 处理真实代理流量，并把目标域名写入 `deploy/xray-reality/logs/access.log`
+3. `xray-ai-domain-manager` 读取最近一小时日志，先走内建强制 AI 路由名单和已知 AI 域名名单
+4. 对剩余未知域名，优先调用本机 `codex`；如果不可用且设置了 `OPENAI_API_KEY`，再回退到 OpenAI Responses API
+5. AI 域名结果写入：
+   - `deploy/xray-reality/runtime/ai-domain-decisions.json`
+   - `deploy/xray-reality/runtime/dynamic-routing.json`
+   - `deploy/xray-reality/reports/hourly-domains/latest.{txt,json}`
+   - `data/panel.db` 中的 `ai_domains`、`ai_domain_observations`
+6. 动态路由片段变化后，管理器会重新渲染 Xray 配置，并在需要时重启 `xray-reality`
+
+## 快速开始
+
+推荐直接使用仓库根目录的 `docker-compose.yml` 启动完整 AI routing 栈。
 
 ### 1. 启动前准备
 
 - Linux 宿主机
 - 已安装 Docker 和 Docker Compose
-- 宿主机上没有占用你准备开放的监听端口
-- 如果继续使用默认探针端口，确认 `31098` 可用
+- 宿主机上确认这些端口没有冲突：
+  - `443`，Xray 默认监听端口
+  - `18080`，面板端口
+  - `31098`，仓库当前默认入口端口和探针观察端口
+- 如果你想让未知域名自动分类，至少满足下面一项：
+  - 宿主机已安装 `codex` CLI，且 `codex login status` 可用
+  - 设置可用的 `OPENAI_API_KEY`
 
-### 2. 启动
+### 2. 准备 Xray REALITY 参数
+
+```bash
+./deploy/xray-reality/scripts/generate-secrets.sh
+cp deploy/xray-reality/.env.example deploy/xray-reality/.env
+```
+
+至少需要修改：
+
+- `XRAY_PUBLIC_HOST`
+- `XRAY_CLIENT_UUID`
+- `XRAY_REALITY_PRIVATE_KEY`
+- `XRAY_REALITY_PUBLIC_KEY`
+- `XRAY_REALITY_SHORT_ID`
+- `XRAY_SERVER_NAME`
+- `XRAY_DEST`
+
+如果你希望通过面板暴露的入口端口接入，例如公网访问 `31098` 再转到本机 Xray `443`：
+
+- 保持 `XRAY_LISTEN_PORT=443`
+- 额外设置 `XRAY_PUBLIC_PORT=31098`
+
+### 3. 渲染配置并启动完整栈
+
+```bash
+python3 deploy/xray-reality/scripts/render_config.py
+docker compose --profile xray up -d --build
+```
+
+这条命令会启动：
+
+- `nginx-forward-panel`
+- `nginx-forward-panel-db-backup`
+- `xray-reality`
+- `xray-ai-domain-manager`
+
+默认配置下：
+
+- 面板地址：`http://服务器IP:18080`
+- 探针监控页：`http://服务器IP:18080/probe-dashboard`
+- 健康检查：`http://服务器IP:18080/healthz`
+- Xray 监听：`0.0.0.0:443`
+- 面板默认把入口端口转发到 `127.0.0.1:443`
+- 数据库持久化到 `./data`
+- 面板日志持久化到 `./logs`
+- Xray 日志持久化到 `./deploy/xray-reality/logs`
+
+仓库当前 `docker-compose.yml` 还带了一个示例值：
+
+- `PANEL_PUBLIC_URL=http://64.186.224.96:18080`
+
+正式部署前建议改成你自己的公网地址，否则页面里的面板地址和订阅链接会继续指向这个示例 URL。
+
+### 4. 验证 AI routing 是否已经生效
+
+默认按一小时窗口执行。想立刻跑一轮分类，可以手动执行：
+
+```bash
+docker compose --profile xray run --rm xray-ai-domain-manager python /workspace/scripts/ai_domain_manager.py --once
+```
+
+常用检查方式：
+
+```bash
+docker compose --profile xray logs -f xray-ai-domain-manager
+cat deploy/xray-reality/reports/hourly-domains/latest.txt
+sed -n '1,220p' deploy/xray-reality/reports/hourly-domains/latest.json
+```
+
+检查共享数据库中的 AI 聚合结果：
+
+```bash
+python3 - <<'PY'
+import sqlite3
+conn = sqlite3.connect('./data/panel.db')
+for row in conn.execute('select domain, classification, total_hits from ai_domains order by domain'):
+    print(row)
+PY
+```
+
+如果 `latest.txt` 里出现类似下面的内容，说明动态规则已经生成：
+
+```text
+route_status: applied
+```
+
+### 5. 停止
+
+```bash
+docker compose --profile xray down
+```
+
+### 6. 如果只想使用面板
 
 ```bash
 docker compose up -d --build
 ```
 
-默认配置下：
+这种模式下只会启动：
 
-- 面板本地访问：`http://服务器IP:18080`
-- 仓库当前 `docker-compose.yml` 额外设置了 `PANEL_PUBLIC_URL=http://64.186.224.96:18080`，页面展示地址和订阅链接会固定使用这个公开 URL
-- 探针监控页：`http://服务器IP:18080/probe-dashboard`
-- 健康检查：`http://服务器IP:18080/healthz`
-- 容器使用 `host` 网络模式
-- 数据库持久化到 `./data`
-- 日志持久化到 `./logs`
-- 数据库备份输出到 `./backups`
-- 新建端口默认转发到本机 `127.0.0.1:443`
-- 默认会同时启动两个服务：
-  - `nginx-forward-panel`
-  - `nginx-forward-panel-db-backup`
+- `nginx-forward-panel`
+- `nginx-forward-panel-db-backup`
 
-仓库自带的 `docker-compose.yml` 还额外做了这些默认覆盖：
+AI routing 相关的 `xray-reality` 和 `xray-ai-domain-manager` 不会启动。
 
-- `PROBE_ENABLED=1`，默认开启后端探针
-- `PROBE_INTERVAL=180`，每 180 秒做一轮探测
-- `PROBE_TEST_LISTEN_PORT=31098`，探针监控页固定观察端口 `31098`
+## AI Routing 组件与产物
 
-### 3. 停止
+AI routing 相关内容主要集中在：
 
-```bash
-docker compose down
-```
+- `deploy/xray-reality/.env`：REALITY 参数和 AI 管理器运行参数
+- `deploy/xray-reality/runtime/config.json`：渲染后的 Xray 服务端配置
+- `deploy/xray-reality/runtime/client-share.txt`：客户端导入链接
+- `deploy/xray-reality/runtime/client-test.json`：本地验证用客户端配置
+- `deploy/xray-reality/runtime/ai-domain-decisions.json`：域名分类缓存
+- `deploy/xray-reality/runtime/dynamic-routing.json`：动态路由片段
+- `deploy/xray-reality/reports/hourly-domains/`：最近一小时和历史归档报告
+- `deploy/xray-reality/logs/access.log`：AI 管理器的主要输入日志
+- `data/panel.db`：共享数据库，保存端口规则、流量和 AI 域名聚合数据
 
-### 4. 查看状态
-
-```bash
-docker compose ps
-docker compose logs -f
-```
-
-## 集成 Xray REALITY
-
-仓库现在额外提供了一套本机 `Xray VLESS + XTLS + REALITY` 配置和脚本，位于：
-
-- `deploy/xray-reality/`
-
-根目录 `docker-compose.yml` 已经包含对应的两个服务：
-
-- `xray-reality`
-- `xray-ai-domain-manager`
-
-它们放在 `xray` profile 下，只有显式加 `--profile xray` 才会启动。
-
-启用后：
-
-- 根面板仍负责统一的 Nginx `stream` 入口管理
-- `xray-ai-domain-manager` 会按小时读取 `deploy/xray-reality/logs/access.log`
-- AI 域名识别结果会写入共享的 `data/panel.db`
-- 当前会额外维护两张表：`ai_domains`、`ai_domain_observations`
-
-快速入口现在统一在仓库根目录执行：
-
-```bash
-cd /root/nginx-forward-panel
-python3 deploy/xray-reality/scripts/render_config.py
-docker compose --profile xray up -d --build xray-reality xray-ai-domain-manager
-```
-
-如果要停掉这两个服务：
-
-```bash
-docker compose --profile xray stop xray-reality xray-ai-domain-manager
-```
-
-`deploy/xray-reality/.env` 仍然是 Reality 参数的主配置文件；`deploy/xray-reality/runtime/` 仍然保存渲染后的 Xray 配置和客户端测试文件。
-
-详细说明见：
+更完整的 REALITY 和 AI 域名管理说明见：
 
 - [deploy/xray-reality/README.md](deploy/xray-reality/README.md)
 
@@ -222,6 +277,17 @@ docker compose --profile xray stop xray-reality xray-ai-domain-manager
 | `DB_BACKUP_KEEP_DAYS` | `7` | 备份保留天数，超期自动清理 |
 | `DB_BACKUP_PREFIX` | `nginx-forward-panel` | 备份文件名前缀，文件名形如 `nginx-forward-panel-20260531T030000Z.db` |
 | `DB_BACKUP_CRON_SCHEDULE` | `0 3 * * *` | 备份定时表达式 |
+| `AI_UPSTREAM_HOST` | `nat.qq.pw` | 命中 AI 域名后转发到的专用上游主机 |
+| `AI_UPSTREAM_PORT` | `31098` | 命中 AI 域名后转发到的专用上游端口 |
+| `AI_DOMAIN_INTERVAL_SECONDS` | `3600` | AI 域名管理器执行周期 |
+| `AI_DOMAIN_LOOKBACK_SECONDS` | `3600` | 每轮分析最近多少秒的访问日志 |
+| `AI_DOMAIN_BATCH_SIZE` | `50` | 单批送给分类器的最大域名数 |
+| `CODEX_CLASSIFIER_ENABLED` | `1` | 是否优先启用本机 `codex` 做未知域名分类 |
+| `CODEX_TIMEOUT_SECONDS` | `180` | 调用本机 `codex` 的超时时间 |
+| `OPENAI_API_KEY` | 空 | 本机 `codex` 不可用时的 OpenAI 回退凭据 |
+| `OPENAI_MODEL` | `gpt-5.5` | OpenAI 回退分类时使用的模型 |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1/responses` | OpenAI Responses API 地址 |
+| `PANEL_ROUTE_LISTEN_PORT` | `0` | 可选；指定某个面板监听端口作为模板里 `__PANEL_*__` 占位符的优先来源 |
 
 代码里还有一些偏内部用途的路径变量，例如：
 
@@ -246,7 +312,12 @@ docker compose --profile xray stop xray-reality xray-ai-domain-manager
 ├── data/
 │   └── panel.db              # SQLite 数据库
 ├── deploy/
-│   └── xray-reality/         # 独立的 Xray REALITY 部署样板
+│   └── xray-reality/
+│       ├── README.md         # Xray REALITY 和 AI 域名管理详细说明
+│       ├── logs/             # Xray 访问日志，AI 管理器从这里读入域名
+│       ├── reports/          # 按小时输出 AI 域名报告
+│       ├── runtime/          # 渲染配置、分类缓存、动态路由片段
+│       └── scripts/          # REALITY 渲染和 AI 域名管理脚本
 ├── logs/
 │   ├── error.log             # Nginx 错误日志
 │   └── stream-access.log     # Nginx stream 访问日志
@@ -256,7 +327,7 @@ docker compose --profile xray stop xray-reality xray-ai-domain-manager
 ├── nginx.conf
 ├── scripts/
 │   ├── backup_db.py          # SQLite 备份脚本
-│   └── start-backup-cron.sh # 备份定时任务启动脚本
+│   └── start-backup-cron.sh  # 备份定时任务启动脚本
 ```
 
 ## 数据与统计
