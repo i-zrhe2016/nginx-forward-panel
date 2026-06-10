@@ -1,6 +1,6 @@
 # Xray VLESS + XTLS + REALITY
 
-这个目录提供一套独立的本机部署样板，不会修改当前 `nginx-forward-panel` 的服务逻辑。
+这个目录提供一套独立的本机部署样板，不会修改当前 `xray-routing-panel` 的服务逻辑。
 
 说明：
 
@@ -37,7 +37,7 @@ ss -ltn 'sport = :443'
 1. 进入目录：
 
 ```bash
-cd /path/to/nginx-forward-panel
+cd /path/to/xray-routing-panel
 ```
 
 2. 生成一组新的 UUID、REALITY 密钥和 short id：
@@ -62,7 +62,7 @@ cp deploy/xray-reality/.env.example deploy/xray-reality/.env
 - `XRAY_SERVER_NAME`
 - `XRAY_DEST`
 
-如果前面还有一层入口转发，例如通过根目录 `nginx-forward-panel` 暴露 `31098` 再转到本机 `443`：
+如果前面还有一层入口转发，例如通过根目录 `xray-routing-panel` 暴露 `31098` 再转到本机 `443`：
 
 - 保持 `XRAY_LISTEN_PORT=443`
 - 额外设置 `XRAY_PUBLIC_PORT=31098`
@@ -229,7 +229,7 @@ accepted tcp:chatgpt.com:443 [ai_proxy]
 | `XRAY_LISTEN_HOST` | 服务端监听地址，通常保持 `0.0.0.0` |
 | `XRAY_LISTEN_PORT` | 服务端监听端口，默认 `443` |
 | `XRAY_PUBLIC_HOST` | 客户端连接时使用的公网 IP 或域名 |
-| `XRAY_PUBLIC_PORT` | 客户端连接时使用的对外端口；留空时默认等于 `XRAY_LISTEN_PORT`，走 `nginx-forward-panel` 时可设为 `31098` |
+| `XRAY_PUBLIC_PORT` | 客户端连接时使用的对外端口；留空时默认等于 `XRAY_LISTEN_PORT`，走 `xray-routing-panel` 时可设为 `31098` |
 | `XRAY_CLIENT_UUID` | VLESS 用户 UUID |
 | `XRAY_FLOW` | 建议保持 `xtls-rprx-vision` |
 | `XRAY_REALITY_PRIVATE_KEY` | REALITY 私钥 |

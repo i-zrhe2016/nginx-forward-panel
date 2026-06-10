@@ -4,7 +4,7 @@
 
 原因很直接：
 
-- `nginx-forward-panel` 会根据数据库里的端口规则，动态让 Nginx `stream` 监听宿主机 TCP 端口
+- `xray-routing-panel` 会根据数据库里的端口规则，动态让 Nginx `stream` 监听宿主机 TCP 端口
 - 这些端口不是预先固定好的 `Service/NodePort` 清单，属于运行时动态变化
 - 面板默认把入口端口转发到本机 `127.0.0.1:443`
 - `xray-ai-domain-manager` 会动态改写 `runtime/config.json`，并在配置变化后重启 Xray
@@ -17,7 +17,7 @@
 
 - 一个 `StatefulSet`
 - 同一个 Pod 内放三个容器：
-  - `nginx-forward-panel`
+  - `xray-routing-panel`
   - `xray-reality`
   - `xray-ai-domain-manager`
 - Pod 使用：
@@ -77,11 +77,11 @@
 先把两个业务镜像打包并推到你的镜像仓库：
 
 ```bash
-docker build -t ghcr.io/your-org/nginx-forward-panel:latest .
-docker build -t ghcr.io/your-org/nginx-forward-panel-ai-manager:latest -f deploy/xray-reality/Dockerfile.ai-manager deploy/xray-reality
+docker build -t ghcr.io/your-org/xray-routing-panel:latest .
+docker build -t ghcr.io/your-org/xray-routing-panel-ai-manager:latest -f deploy/xray-reality/Dockerfile.ai-manager deploy/xray-reality
 
-docker push ghcr.io/your-org/nginx-forward-panel:latest
-docker push ghcr.io/your-org/nginx-forward-panel-ai-manager:latest
+docker push ghcr.io/your-org/xray-routing-panel:latest
+docker push ghcr.io/your-org/xray-routing-panel-ai-manager:latest
 ```
 
 说明：
@@ -94,7 +94,7 @@ docker push ghcr.io/your-org/nginx-forward-panel-ai-manager:latest
 给目标节点打标签：
 
 ```bash
-kubectl label node <your-node> nginx-forward-panel/edge=true
+kubectl label node <your-node> xray-routing-panel/edge=true
 ```
 
 如果这台节点还承载其他关键业务，建议额外配一组 taint / toleration，把入口流量和其他工作负载隔离开。
@@ -195,34 +195,34 @@ XRAY_RESTART_COMMAND=kill $(pidof xray)
 ### 1. 看 Pod 状态
 
 ```bash
-kubectl -n nginx-forward-panel get pods -o wide
+kubectl -n xray-routing-panel get pods -o wide
 ```
 
 ### 2. 看面板健康检查
 
 ```bash
-kubectl -n nginx-forward-panel exec -it nginx-forward-panel-0 -c nginx-forward-panel -- \
+kubectl -n xray-routing-panel exec -it xray-routing-panel-0 -c xray-routing-panel -- \
   python3 -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:18080/healthz').read().decode())"
 ```
 
 ### 3. 看 Xray 配置是否有效
 
 ```bash
-kubectl -n nginx-forward-panel exec -it nginx-forward-panel-0 -c xray-reality -- \
+kubectl -n xray-routing-panel exec -it xray-routing-panel-0 -c xray-reality -- \
   /usr/local/bin/xray run -test -config /xray-runtime/config.json
 ```
 
 ### 4. 触发一次 AI 域名管理器
 
 ```bash
-kubectl -n nginx-forward-panel exec -it nginx-forward-panel-0 -c xray-ai-domain-manager -- \
+kubectl -n xray-routing-panel exec -it xray-routing-panel-0 -c xray-ai-domain-manager -- \
   python /workspace/scripts/ai_domain_manager.py --once
 ```
 
 ### 5. 看最近一小时报告
 
 ```bash
-kubectl -n nginx-forward-panel exec -it nginx-forward-panel-0 -c xray-ai-domain-manager -- \
+kubectl -n xray-routing-panel exec -it xray-routing-panel-0 -c xray-ai-domain-manager -- \
   cat /workspace/reports/hourly-domains/latest.txt
 ```
 
@@ -245,7 +245,7 @@ kubectl -n nginx-forward-panel exec -it nginx-forward-panel-0 -c xray-ai-domain-
 
 起步建议：
 
-- `nginx-forward-panel`
+- `xray-routing-panel`
   - `100m / 256Mi`
 - `xray-reality`
   - `200m / 256Mi`

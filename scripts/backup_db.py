@@ -23,7 +23,7 @@ def parse_args():
     parser.add_argument("--db-path", default=os.environ.get("DB_PATH", "/data/panel.db"))
     parser.add_argument("--backup-dir", default=os.environ.get("DB_BACKUP_DIR", "/backups"))
     parser.add_argument("--keep-days", type=non_negative_int, default=non_negative_int(keep_days))
-    parser.add_argument("--prefix", default=os.environ.get("DB_BACKUP_PREFIX", "nginx-forward-panel"))
+    parser.add_argument("--prefix", default=os.environ.get("DB_BACKUP_PREFIX", "xray-routing-panel"))
     return parser.parse_args()
 
 

@@ -1,8 +1,8 @@
 apiVersion: batch/v1
 kind: CronJob
 metadata:
-  name: nginx-forward-panel-db-backup
-  namespace: nginx-forward-panel
+  name: xray-routing-panel-db-backup
+  namespace: xray-routing-panel
 spec:
   schedule: "0 3 * * *"
   concurrencyPolicy: Forbid
@@ -14,10 +14,10 @@ spec:
         spec:
           restartPolicy: OnFailure
           nodeSelector:
-            nginx-forward-panel/edge: "true"
+            xray-routing-panel/edge: "true"
           containers:
             - name: backup
-              image: ghcr.io/your-org/nginx-forward-panel:latest
+              image: ghcr.io/your-org/xray-routing-panel:latest
               imagePullPolicy: IfNotPresent
               command:
                 - python3
@@ -29,7 +29,7 @@ spec:
                 - --keep-days
                 - "7"
                 - --prefix
-                - nginx-forward-panel
+                - xray-routing-panel
               resources:
                 requests:
                   cpu: 50m

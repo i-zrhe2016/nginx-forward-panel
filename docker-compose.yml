@@ -1,9 +1,9 @@
-name: nginx-forward-panel
+name: xray-routing-panel
 
 services:
-  nginx-forward-panel:
+  xray-routing-panel:
     build: .
-    container_name: nginx-forward-panel
+    container_name: xray-routing-panel
     restart: unless-stopped
     network_mode: host
     ulimits:
@@ -31,16 +31,16 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-  nginx-forward-panel-db-backup:
+  xray-routing-panel-db-backup:
     build: .
-    container_name: nginx-forward-panel-db-backup
+    container_name: xray-routing-panel-db-backup
     restart: unless-stopped
     command: ["sh", "/app/scripts/start-backup-cron.sh"]
     environment:
       DB_PATH: "/data/panel.db"
       DB_BACKUP_DIR: "/backups"
       DB_BACKUP_KEEP_DAYS: "7"
-      DB_BACKUP_PREFIX: "nginx-forward-panel"
+      DB_BACKUP_PREFIX: "xray-routing-panel"
       DB_BACKUP_CRON_SCHEDULE: "0 3 * * *"
     volumes:
       - ./data:/data

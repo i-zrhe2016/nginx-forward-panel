@@ -1,6 +1,6 @@
 # 面板迁移文档
 
-本文档用于把当前这套 `nginx-forward-panel` 从旧机器迁移到新机器。
+本文档用于把当前这套 `xray-routing-panel` 从旧机器迁移到新机器。
 
 ## 迁移目标
 
@@ -51,7 +51,7 @@ docker compose down
 ### 2. 备份旧数据
 
 ```bash
-tar -czf nginx-forward-panel-backup.tar.gz data logs docker-compose.yml nginx.conf
+tar -czf xray-routing-panel-backup.tar.gz data logs docker-compose.yml nginx.conf
 ```
 
 如果你没有改过 `docker-compose.yml` 或 `nginx.conf`，也可以只备份 `data` 和 `logs`。
@@ -66,7 +66,7 @@ tar -czf nginx-forward-panel-backup.tar.gz data logs docker-compose.yml nginx.co
 ### 4. 恢复数据
 
 ```bash
-tar -xzf nginx-forward-panel-backup.tar.gz
+tar -xzf xray-routing-panel-backup.tar.gz
 ```
 
 如果只迁规则，把旧机器的 `panel.db` 复制到新机器的 `./data/panel.db`。
@@ -88,7 +88,7 @@ curl http://127.0.0.1:18080/healthz
 也可以检查生成的转发配置：
 
 ```bash
-docker exec -it nginx-forward-panel cat /etc/nginx/streams-enabled/ports.conf
+docker exec -it xray-routing-panel cat /etc/nginx/streams-enabled/ports.conf
 ```
 
 ## 迁移后检查项

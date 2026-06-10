@@ -1,10 +1,10 @@
-# nginx-forward-panel
+# xray-routing-panel
 
-`nginx-forward-panel` 当前更适合被理解成一套“AI routing 控制面 + Xray REALITY 数据面”的组合部署，而不只是一个 TCP 端口面板。
+`xray-routing-panel` 当前更适合被理解成一套“AI routing 控制面 + Xray REALITY 数据面”的组合部署，而不只是一个 TCP 端口面板。
 
 这套仓库里的核心链路是：
 
-- `nginx-forward-panel` 用 Nginx `stream` 管理入口端口，把公网 TCP 入口稳定转发到本机 Xray
+- `xray-routing-panel` 用 Nginx `stream` 管理入口端口，把公网 TCP 入口稳定转发到本机 Xray
 - `xray-reality` 负责实际代理连接和路由命中
 - `xray-ai-domain-manager` 按小时分析 Xray 访问日志，识别 AI 域名并生成动态路由片段
 - 命中的 AI 域名自动改走 `AI_UPSTREAM_HOST:AI_UPSTREAM_PORT`
@@ -113,8 +113,8 @@ docker compose --profile xray up -d --build
 
 这条命令会启动：
 
-- `nginx-forward-panel`
-- `nginx-forward-panel-db-backup`
+- `xray-routing-panel`
+- `xray-routing-panel-db-backup`
 - `xray-reality`
 - `xray-ai-domain-manager`
 
@@ -182,8 +182,8 @@ docker compose up -d --build
 
 这种模式下只会启动：
 
-- `nginx-forward-panel`
-- `nginx-forward-panel-db-backup`
+- `xray-routing-panel`
+- `xray-routing-panel-db-backup`
 
 AI routing 相关的 `xray-reality` 和 `xray-ai-domain-manager` 不会启动。
 
@@ -275,7 +275,7 @@ AI routing 相关内容主要集中在：
 | `DB_PATH` | `/data/panel.db` | SQLite 数据库路径 |
 | `DB_BACKUP_DIR` | `/backups` | SQLite 备份输出目录 |
 | `DB_BACKUP_KEEP_DAYS` | `7` | 备份保留天数，超期自动清理 |
-| `DB_BACKUP_PREFIX` | `nginx-forward-panel` | 备份文件名前缀，文件名形如 `nginx-forward-panel-20260531T030000Z.db` |
+| `DB_BACKUP_PREFIX` | `xray-routing-panel` | 备份文件名前缀，文件名形如 `xray-routing-panel-20260531T030000Z.db` |
 | `DB_BACKUP_CRON_SCHEDULE` | `0 3 * * *` | 备份定时表达式 |
 | `AI_UPSTREAM_HOST` | `nat.qq.pw` | 命中 AI 域名后转发到的专用上游主机 |
 | `AI_UPSTREAM_PORT` | `31098` | 命中 AI 域名后转发到的专用上游端口 |
@@ -368,7 +368,7 @@ GET /healthz
 
 ## 数据备份与迁移
 
-- 根目录 `docker-compose.yml` 默认会启动 `nginx-forward-panel-db-backup`，按 `DB_BACKUP_CRON_SCHEDULE` 定时备份 `panel.db`
+- 根目录 `docker-compose.yml` 默认会启动 `xray-routing-panel-db-backup`，按 `DB_BACKUP_CRON_SCHEDULE` 定时备份 `panel.db`
 - 默认备份目录是 `./backups`
 - 手动备份可执行：
 
@@ -385,7 +385,7 @@ python3 ./scripts/backup_db.py --db-path ./data/panel.db --backup-dir ./backups
 
 - `docker-compose.yml` 使用的是 `network_mode: host`，更适合 Linux 主机。
 - 面板里创建的监听端口会直接在宿主机生效，避免和宿主机已有服务端口冲突。
-- `nginx-forward-panel-db-backup` 服务会按定时表达式把 `panel.db` 备份到 `./backups`。
+- `xray-routing-panel-db-backup` 服务会按定时表达式把 `panel.db` 备份到 `./backups`。
 - 如果设置了 `PANEL_USERNAME` 或 `PANEL_PASSWORD`，面板会启用 Basic Auth。
 - 删除端口时会同时删除该端口对应的累计统计数据。
 - 程序依赖 `nginx-full` 的 `stream` 能力，镜像里已经安装好。
@@ -403,7 +403,7 @@ docker compose down
 如果需要进入容器检查：
 
 ```bash
-docker exec -it nginx-forward-panel bash
+docker exec -it xray-routing-panel bash
 nginx -t
 cat /etc/nginx/streams-enabled/ports.conf
 ```
@@ -413,7 +413,7 @@ cat /etc/nginx/streams-enabled/ports.conf
 ```bash
 python3 ./scripts/backup_db.py --db-path ./data/panel.db --backup-dir ./backups
 ls -lh ./backups
-tail -f ./logs/nginx-forward-panel-db-backup.log
+tail -f ./logs/xray-routing-panel-db-backup.log
 ```
 
 ## 后续可扩展方向
