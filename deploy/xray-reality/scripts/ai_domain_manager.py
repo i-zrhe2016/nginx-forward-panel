@@ -19,6 +19,32 @@ TARGET_RE = re.compile(r" accepted (?P<proto>[a-z]+):(?P<target>\S+)")
 DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9-]{2,63}$")
 PLACEHOLDER_RE = re.compile(r"__([A-Z0-9_]+)__")
 UNSET_PROXY_PROTOCOL = "replace_me"
+FORCED_AI_ROUTE_DOMAIN_SUFFIXES = (
+    "anthropic.com",
+    "api.ip.sb",
+    "api.ipify.org",
+    "checkip.amazonaws.com",
+    "cip.cc",
+    "claude.ai",
+    "claude.com",
+    "claudeusercontent.com",
+    "ident.me",
+    "icanhazip.com",
+    "ifconfig.co",
+    "ifconfig.me",
+    "ip-api.com",
+    "ipapi.co",
+    "ipinfo.io",
+    "ip.sb",
+    "ipify.org",
+    "ippure.com",
+    "ipw.cn",
+    "ipv4.icanhazip.com",
+    "ipv6.icanhazip.com",
+    "myip.ipip.net",
+    "myexternalip.com",
+    "seeip.org",
+)
 KNOWN_AI_DOMAIN_SUFFIXES = (
     "ai.google.dev",
     "aistudio.google.com",
@@ -213,8 +239,59 @@ def normalize_classification(value):
     return "unknown"
 
 
+def matches_domain_suffixes(domain, suffixes):
+    return any(domain == suffix or domain.endswith(f".{suffix}") for suffix in suffixes)
+
+
+def matches_forced_ai_route_domain(domain):
+    return matches_domain_suffixes(domain, FORCED_AI_ROUTE_DOMAIN_SUFFIXES)
+
+
 def matches_known_ai_domain(domain):
-    return any(domain == suffix or domain.endswith(f".{suffix}") for suffix in KNOWN_AI_DOMAIN_SUFFIXES)
+    return matches_domain_suffixes(domain, KNOWN_AI_DOMAIN_SUFFIXES)
+
+
+def sync_builtin_domain_decisions(decisions, decisions_path, observed_domains):
+    changed = False
+    candidate_domains = set(decisions["domains"]) | set(observed_domains) | set(FORCED_AI_ROUTE_DOMAIN_SUFFIXES)
+    classified_at = format_timestamp(utc_now())
+    for domain in sorted(candidate_domains):
+        if matches_forced_ai_route_domain(domain):
+            payload = {
+                "classification": "ai",
+                "reason": "matched_forced_ai_route_domain",
+                "classified_at": classified_at,
+                "source": "builtin",
+                "model": "builtin-forced-ai-route-domains",
+            }
+        elif matches_known_ai_domain(domain):
+            payload = {
+                "classification": "ai",
+                "reason": "matched_known_ai_domain",
+                "classified_at": classified_at,
+                "source": "builtin",
+                "model": "builtin-known-ai-domains",
+            }
+        else:
+            continue
+
+        existing = decisions["domains"].get(domain)
+        if existing:
+            same = (
+                existing.get("classification") == payload["classification"]
+                and existing.get("reason") == payload["reason"]
+                and existing.get("source") == payload["source"]
+                and existing.get("model") == payload["model"]
+            )
+            if same:
+                continue
+
+        decisions["domains"][domain] = payload
+        changed = True
+
+    if changed:
+        save_json(decisions_path, decisions)
+    return changed
 
 
 def extract_output_text(payload):
@@ -545,14 +622,20 @@ def save_ai_domains_to_panel_db(panel_db_path, report, decisions):
         status["reason"] = "panel_db_missing"
         return status
 
-    ai_items = [item for item in report["domains"] if item["classification"] == "ai"]
+    observed_ai_items = [item for item in report["domains"] if item["classification"] == "ai"]
+    observed_ai_by_domain = {item["domain"]: item for item in observed_ai_items}
+    ai_domains = sorted(
+        domain
+        for domain, item in decisions["domains"].items()
+        if item.get("classification") == "ai"
+    )
     conn = sqlite3.connect(panel_db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 5000")
     try:
         ensure_ai_domain_schema(conn)
 
-        for item in ai_items:
+        for item in observed_ai_items:
             decision = decisions["domains"].get(item["domain"], {})
             protocols = json.dumps(item["protocols"], ensure_ascii=True)
             conn.execute(
@@ -597,6 +680,21 @@ def save_ai_domains_to_panel_db(panel_db_path, report, decisions):
                     report["generated_at"],
                 ),
             )
+            status["observations_upserted"] += 1
+
+        for domain in ai_domains:
+            item = observed_ai_by_domain.get(
+                domain,
+                {
+                    "domain": domain,
+                    "classification": "ai",
+                    "reason": decisions["domains"].get(domain, {}).get("reason", ""),
+                    "protocols": [],
+                    "first_seen": None,
+                    "last_seen": None,
+                },
+            )
+            decision = decisions["domains"].get(domain, {})
             aggregate = conn.execute(
                 """
                 SELECT
@@ -606,8 +704,15 @@ def save_ai_domains_to_panel_db(panel_db_path, report, decisions):
                 FROM ai_domain_observations
                 WHERE domain = ?
                 """,
-                (item["domain"],),
+                (domain,),
             ).fetchone()
+            existing = conn.execute(
+                "SELECT last_protocols FROM ai_domains WHERE domain = ?",
+                (domain,),
+            ).fetchone()
+            protocols = json.dumps(item["protocols"], ensure_ascii=True)
+            if not item["protocols"] and existing and existing["last_protocols"]:
+                protocols = existing["last_protocols"]
             conn.execute(
                 """
                 INSERT INTO ai_domains (
@@ -638,13 +743,13 @@ def save_ai_domains_to_panel_db(panel_db_path, report, decisions):
                     updated_at = excluded.updated_at
                 """,
                 (
-                    item["domain"],
+                    domain,
                     item["classification"],
                     item["reason"],
                     str(decision.get("source", "")).strip(),
                     str(decision.get("model", "")).strip(),
-                    aggregate["first_seen"],
-                    aggregate["last_seen"],
+                    aggregate["first_seen"] or item.get("first_seen"),
+                    aggregate["last_seen"] or item.get("last_seen"),
                     int(aggregate["total_hits"]),
                     protocols,
                     report["window_start"],
@@ -653,7 +758,6 @@ def save_ai_domains_to_panel_db(panel_db_path, report, decisions):
                 ),
             )
             status["domains_upserted"] += 1
-            status["observations_upserted"] += 1
 
         stale_domains = [
             domain
@@ -990,6 +1094,7 @@ def run_once(args):
 
     decisions = load_decisions(args.classification_state_path)
     observed_domains = {item["domain"] for item in log_state["events"]}
+    sync_builtin_domain_decisions(decisions, args.classification_state_path, observed_domains)
     ai_target = {
         "upstream_host": args.ai_upstream_host,
         "upstream_port": args.ai_upstream_port,
