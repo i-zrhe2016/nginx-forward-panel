@@ -6,3 +6,13 @@ logs/
 backups/
 
 dimt_v2/
+deploy/xray-reality/.env
+deploy/xray-reality/ai-proxy-outbound.json
+!deploy/xray-reality/logs/
+deploy/xray-reality/logs/*
+!deploy/xray-reality/logs/.gitkeep
+deploy/xray-reality/runtime/*
+!deploy/xray-reality/runtime/.gitkeep
+!deploy/xray-reality/reports/
+deploy/xray-reality/reports/*
+!deploy/xray-reality/reports/.gitkeep

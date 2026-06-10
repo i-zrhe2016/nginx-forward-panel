@@ -8,9 +8,11 @@ services:
     network_mode: host
     environment:
       PANEL_PORT: "18080"
-      DEFAULT_UPSTREAM_HOST: "nat.qq.pw"
-      DEFAULT_UPSTREAM_PORT: "31098"
+      PANEL_PUBLIC_URL: "http://64.186.224.96:18080"
+      DEFAULT_UPSTREAM_HOST: "127.0.0.1"
+      DEFAULT_UPSTREAM_PORT: "443"
       SEED_LISTEN_PORT: "31098"
+      XRAY_CLIENT_CONFIG_PATH: "/xray-runtime/client-test.json"
       PANEL_USERNAME: ""
       PANEL_PASSWORD: ""
       PROBE_ENABLED: "1"
@@ -19,6 +21,7 @@ services:
     volumes:
       - ./data:/data
       - ./logs:/var/log/nginx
+      - ./deploy/xray-reality/runtime:/xray-runtime:ro
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18080/healthz', timeout=3).read()"]
       interval: 30s
@@ -39,3 +42,58 @@ services:
       - ./data:/data
       - ./backups:/backups
       - ./logs:/var/log
+  xray-reality:
+    profiles: ["xray"]
+    image: ghcr.io/xtls/xray-core:26.5.3
+    container_name: xray-reality-local
+    user: "0:0"
+    restart: unless-stopped
+    network_mode: host
+    command: ["run", "-c", "/etc/xray/config.json"]
+    volumes:
+      - ./deploy/xray-reality/runtime/config.json:/etc/xray/config.json:ro
+      - ./deploy/xray-reality/logs:/var/log/xray
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/xray", "run", "-test", "-config", "/etc/xray/config.json"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+  xray-ai-domain-manager:
+    profiles: ["xray"]
+    build:
+      context: ./deploy/xray-reality
+      dockerfile: Dockerfile.ai-manager
+    restart: unless-stopped
+    depends_on:
+      xray-reality:
+        condition: service_started
+    command: ["python", "/workspace/scripts/ai_domain_manager.py"]
+    env_file:
+      - ./deploy/xray-reality/.env
+    environment:
+      XRAY_WORKSPACE_DIR: "/workspace"
+      PANEL_DB_PATH: "/panel-data/panel.db"
+      AI_DOMAIN_INTERVAL_SECONDS: "3600"
+      AI_DOMAIN_LOOKBACK_SECONDS: "3600"
+      AI_DOMAIN_BATCH_SIZE: "50"
+      CODEX_CLASSIFIER_ENABLED: "${CODEX_CLASSIFIER_ENABLED:-1}"
+      CODEX_TIMEOUT_SECONDS: "${CODEX_TIMEOUT_SECONDS:-180}"
+      CODEX_SOURCE_HOME: "/host-codex-home"
+      CODEX_RUNTIME_HOME: "/workspace/runtime/codex-home"
+      CODEX_WORKDIR: "/tmp/codex-domain-classifier"
+      CODEX_NODE_BIN: "/usr/bin/node"
+      CODEX_NODE_VERSIONS_ROOT: "/host-node-versions"
+      CODEX_CLI_JS: "${CODEX_CLI_JS:-}"
+      CODEX_BIN: "${CODEX_BIN:-}"
+      CODEX_MODEL: "${CODEX_MODEL:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      OPENAI_MODEL: "${OPENAI_MODEL:-gpt-5.5}"
+      OPENAI_BASE_URL: "${OPENAI_BASE_URL:-https://api.openai.com/v1/responses}"
+      PANEL_ROUTE_LISTEN_PORT: "${PANEL_ROUTE_LISTEN_PORT:-0}"
+      XRAY_RESTART_CONTAINER: "xray-reality-local"
+    volumes:
+      - ./deploy/xray-reality:/workspace
+      - ./data:/panel-data
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /root/.codex:/host-codex-home:ro
+      - /root/.nvm/versions/node:/host-node-versions:ro

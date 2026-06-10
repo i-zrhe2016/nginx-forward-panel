@@ -105,7 +105,8 @@ h3 {
 .meta-block span,
 .traffic-grid span,
 label span,
-.meta-row span {
+.meta-row span,
+.fixed-target span {
   color: var(--muted);
 }
 
@@ -132,7 +133,8 @@ label span,
 .stat-card span,
 .traffic-grid span,
 label span,
-.meta-row span {
+.meta-row span,
+.fixed-target span {
   display: block;
   font-size: 13px;
   margin-bottom: 8px;
@@ -141,7 +143,8 @@ label span,
 .meta-block strong,
 .stat-card strong,
 .traffic-grid strong,
-.meta-row strong {
+.meta-row strong,
+.fixed-target strong {
   font-size: 18px;
 }
 
@@ -208,9 +211,35 @@ label span,
   margin-bottom: 18px;
 }
 
+.subscription-panel-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: start;
+  gap: 16px;
+}
+
 .panel-head p,
 .list-head p {
   margin: 10px 0 0;
+}
+
+.subscription-overview {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.subscription-alert {
+  padding: 18px;
+  border-radius: 18px;
+  background: rgba(255, 243, 241, 0.92);
+  border: 1px solid rgba(159, 61, 49, 0.16);
+  color: var(--bad);
+}
+
+.subscription-alert p {
+  margin: 8px 0 0;
+  color: inherit;
 }
 
 .editor-grid {
@@ -225,6 +254,13 @@ label span,
 
 .editor-grid .full {
   grid-column: 1 / -1;
+}
+
+.fixed-target {
+  padding: 16px;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.48);
+  border: 1px solid rgba(108, 90, 72, 0.08);
 }
 
 label {
@@ -425,6 +461,37 @@ button:disabled {
   border: 1px solid rgba(108, 90, 72, 0.08);
 }
 
+.subscription-shell {
+  margin-top: 18px;
+  padding: 18px;
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.42);
+  border: 1px solid rgba(108, 90, 72, 0.08);
+}
+
+.subscription-shell-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: start;
+}
+
+.subscription-shell-head h4 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.subscription-shell-head p {
+  margin: 8px 0 0;
+  color: var(--muted);
+}
+
+.subscription-grid {
+  display: grid;
+  gap: 14px;
+  margin-top: 16px;
+}
+
 .footer-actions {
   margin-top: 18px;
   padding-top: 18px;
@@ -613,7 +680,8 @@ button:disabled {
   .hero,
   .stats-grid,
   .editor-grid,
-  .traffic-grid {
+  .traffic-grid,
+  .subscription-overview {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -631,7 +699,8 @@ button:disabled {
   .hero,
   .stats-grid,
   .editor-grid,
-  .traffic-grid {
+  .traffic-grid,
+  .subscription-overview {
     grid-template-columns: 1fr;
   }
 
@@ -643,7 +712,9 @@ button:disabled {
 
   .card-head,
   .footer-actions,
-  .list-head {
+  .list-head,
+  .subscription-panel-head,
+  .subscription-shell-head {
     flex-direction: column;
     align-items: stretch;
   }

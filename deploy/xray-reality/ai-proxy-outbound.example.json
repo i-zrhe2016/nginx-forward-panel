@@ -1,0 +1,14 @@
+{
+  "outbounds": [
+    {
+      "tag": "ai_proxy",
+      "protocol": "replace_me",
+      "settings": {
+        "replace_me": {
+          "address": "__AI_UPSTREAM_HOST__",
+          "port": __AI_UPSTREAM_PORT__
+        }
+      }
+    }
+  ]
+}

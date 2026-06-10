@@ -19,7 +19,7 @@
         <div class="hero-meta">
           <div class="meta-block">
             <span>面板地址</span>
-            <strong>{{ panel_host }}:{{ panel_port }}</strong>
+            <strong>{{ panel_public_url or (panel_host ~ ':' ~ panel_port) }}</strong>
           </div>
           <div class="meta-block">
             <span>nginx 状态</span>
@@ -68,23 +68,56 @@
       </section>
 
       <section class="panel">
+        <div class="panel-head subscription-panel-head">
+          <div>
+            <h2>订阅链接</h2>
+            <p>按端口生成专属订阅。路径格式固定为 `/{token}/{port}`，默认输出 Clash，也同时提供 V2Ray 订阅和直连分享链接。</p>
+          </div>
+          {% if subscription.available %}
+          <form method="post" action="{{ url_for('rotate_subscription') }}" onsubmit="return confirm('确认重新生成订阅链接吗？旧链接会立即失效。');">
+            <button class="secondary" type="submit">重新生成订阅链接</button>
+          </form>
+          {% endif %}
+        </div>
+
+        {% if subscription.available %}
+        <div class="subscription-overview">
+          <div class="meta-block">
+            <span>订阅 token</span>
+            <strong>{{ subscription.token }}</strong>
+          </div>
+          <div class="meta-block">
+            <span>客户端目标</span>
+            <strong>{{ subscription.server }}</strong>
+          </div>
+          <div class="meta-block">
+            <span>路径示例</span>
+            <strong>/{{ subscription.token }}/31098</strong>
+          </div>
+        </div>
+        {% else %}
+        <div class="subscription-alert">
+          <strong>订阅功能未就绪</strong>
+          <p>{{ subscription.error }}</p>
+          <p>当前读取路径：{{ subscription.client_config_path }}</p>
+        </div>
+        {% endif %}
+      </section>
+
+      <section class="panel">
         <div class="panel-head">
           <h2>新增端口</h2>
-          <p>监听端口会直接在宿主机生效。到期时间留空表示不过期，流量上限留空表示不限流。</p>
+          <p>监听端口会直接在宿主机生效，并固定转发到 {{ default_upstream_host }}:{{ default_upstream_port }}。到期时间留空表示不过期，流量上限留空表示不限流。</p>
         </div>
         <form class="editor-grid" method="post" action="{{ url_for('create_port') }}">
           <label>
             <span>监听端口</span>
             <input type="number" name="listen_port" min="1" max="65535" required>
           </label>
-          <label>
-            <span>目标主机</span>
-            <input type="text" name="upstream_host" value="{{ default_upstream_host }}" required>
-          </label>
-          <label>
-            <span>目标端口</span>
-            <input type="number" name="upstream_port" min="1" max="65535" value="{{ default_upstream_port }}" required>
-          </label>
+          <div class="fixed-target">
+            <span>固定后端</span>
+            <strong>{{ default_upstream_host }}:{{ default_upstream_port }}</strong>
+          </div>
           <label>
             <span>到期时间（{{ timezone_label }}）</span>
             <input type="datetime-local" name="expires_at">
@@ -122,7 +155,7 @@
             <div class="card-head">
               <div>
                 <h3>{{ port.listen_port }}</h3>
-                <p>{{ port.upstream_host }}:{{ port.upstream_port }}</p>
+                <p>固定转发到 {{ port.upstream_host }}:{{ port.upstream_port }}</p>
               </div>
               <span class="badge {{ port.status }}">{{ port.status_label }}</span>
             </div>
@@ -164,19 +197,40 @@
               {% endif %}
             </div>
 
+            {% if subscription.available and port.subscription %}
+            <div class="subscription-shell">
+              <div class="subscription-shell-head">
+                <div>
+                  <h4>订阅输出</h4>
+                  <p>当前端口专属路径：`/{{ subscription.token }}/{{ port.listen_port }}`</p>
+                </div>
+              </div>
+              <div class="subscription-grid">
+                <label class="full">
+                  <span>Clash 订阅</span>
+                  <input type="text" value="{{ port.subscription.clash_url }}" readonly onclick="this.select()">
+                </label>
+                <label class="full">
+                  <span>V2Ray 订阅</span>
+                  <input type="text" value="{{ port.subscription.v2ray_url }}" readonly onclick="this.select()">
+                </label>
+                <label class="full">
+                  <span>VLESS 直连分享</span>
+                  <input type="text" value="{{ port.subscription.share_link }}" readonly onclick="this.select()">
+                </label>
+              </div>
+            </div>
+            {% endif %}
+
             <form class="editor-grid compact" method="post" action="{{ url_for('update_port', port_id=port.id) }}">
               <label>
                 <span>监听端口</span>
                 <input type="number" name="listen_port" min="1" max="65535" value="{{ port.listen_port }}" required>
               </label>
-              <label>
-                <span>目标主机</span>
-                <input type="text" name="upstream_host" value="{{ port.upstream_host }}" required>
-              </label>
-              <label>
-                <span>目标端口</span>
-                <input type="number" name="upstream_port" min="1" max="65535" value="{{ port.upstream_port }}" required>
-              </label>
+              <div class="fixed-target">
+                <span>固定后端</span>
+                <strong>{{ default_upstream_host }}:{{ default_upstream_port }}</strong>
+              </div>
               <label>
                 <span>到期时间（{{ timezone_label }}）</span>
                 <input type="datetime-local" name="expires_at" value="{{ port.expires_at_input }}">

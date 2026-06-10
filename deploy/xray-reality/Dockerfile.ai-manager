@@ -1,0 +1,7 @@
+FROM python:3.12-alpine
+
+RUN apk add --no-cache ca-certificates docker-cli nodejs
+
+WORKDIR /workspace
+
+CMD ["python", "/workspace/scripts/ai_domain_manager.py"]

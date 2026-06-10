@@ -19,7 +19,7 @@
         <div class="hero-meta">
           <div class="meta-block">
             <span>面板地址</span>
-            <strong>{{ panel_host }}:{{ panel_port }}</strong>
+            <strong>{{ panel_public_url or (panel_host ~ ':' ~ panel_port) }}</strong>
           </div>
           <div class="meta-block">
             <span>nginx 状态</span>

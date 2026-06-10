@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 import atexit
 import base64
+import json
 import os
 import re
+import secrets
 import socket
 import signal
 import sqlite3
+import string
 import subprocess
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote, urlencode
 
-from flask import Flask, Response, jsonify, redirect, render_template, request, url_for
+from flask import Flask, Response, abort, jsonify, redirect, render_template, request, url_for
 
 
 def parse_optional_env_port(value, field_name):
@@ -36,14 +40,17 @@ STREAMS_DIR = Path(os.environ.get("STREAMS_DIR", "/etc/nginx/streams-enabled"))
 GENERATED_STREAM_CONFIG = STREAMS_DIR / "ports.conf"
 STREAM_ACCESS_LOG = Path(os.environ.get("STREAM_ACCESS_LOG", "/var/log/nginx/stream-access.log"))
 NGINX_PID_PATH = Path(os.environ.get("NGINX_PID_PATH", "/var/run/nginx.pid"))
+XRAY_CLIENT_CONFIG_PATH = Path(os.environ.get("XRAY_CLIENT_CONFIG_PATH", "/xray-runtime/client-test.json"))
+SUBSCRIPTION_NAME_PREFIX = os.environ.get("SUBSCRIPTION_NAME_PREFIX", "reality").strip() or "reality"
 
 PANEL_HOST = os.environ.get("PANEL_HOST", "0.0.0.0")
 PANEL_PORT = int(os.environ.get("PANEL_PORT", "18080"))
+PANEL_PUBLIC_URL = os.environ.get("PANEL_PUBLIC_URL", "").strip().rstrip("/")
 PANEL_USERNAME = os.environ.get("PANEL_USERNAME", "")
 PANEL_PASSWORD = os.environ.get("PANEL_PASSWORD", "")
 
-DEFAULT_UPSTREAM_HOST = os.environ.get("DEFAULT_UPSTREAM_HOST", "nat.qq.pw")
-DEFAULT_UPSTREAM_PORT = int(os.environ.get("DEFAULT_UPSTREAM_PORT", "31098"))
+DEFAULT_UPSTREAM_HOST = os.environ.get("DEFAULT_UPSTREAM_HOST", "127.0.0.1")
+DEFAULT_UPSTREAM_PORT = int(os.environ.get("DEFAULT_UPSTREAM_PORT", "443"))
 SEED_LISTEN_PORT = os.environ.get("SEED_LISTEN_PORT", "31098").strip()
 PROXY_CONNECT_TIMEOUT = os.environ.get("PROXY_CONNECT_TIMEOUT", "5s")
 PROXY_TIMEOUT = os.environ.get("PROXY_TIMEOUT", "600s")
@@ -62,7 +69,6 @@ PROBE_DASHBOARD_RANGES = {
     "7d": {"hours": 24 * 7, "label": "7天"},
 }
 
-HOST_PATTERN = re.compile(r"^(?:[A-Za-z0-9][A-Za-z0-9.-]*|\[[0-9A-Fa-f:]+\])$")
 LOCAL_TZ = datetime.now().astimezone().tzinfo or timezone.utc
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
@@ -88,15 +94,6 @@ def parse_port(value, field_name):
     if port < 1 or port > 65535:
         raise ValidationError(f"{field_name} 必须在 1-65535 之间。")
     return port
-
-
-def parse_host(value):
-    host = str(value or "").strip()
-    if not host:
-        raise ValidationError("目标主机不能为空。")
-    if not HOST_PATTERN.fullmatch(host):
-        raise ValidationError("目标主机格式不合法，仅支持域名、IPv4 或方括号包裹的 IPv6。")
-    return host
 
 
 def parse_note(value):
@@ -194,6 +191,383 @@ def localize_time(value):
     return datetime.fromisoformat(value).astimezone(LOCAL_TZ)
 
 
+def generate_subscription_token(length=12):
+    alphabet = string.ascii_lowercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def normalize_subscription_name(note, listen_port):
+    note_text = re.sub(r"\s+", " ", str(note or "").strip())
+    if note_text:
+        return f"{note_text}-{listen_port}"
+    return f"{SUBSCRIPTION_NAME_PREFIX}-{listen_port}"
+
+
+def yaml_quote(value):
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def current_request_scheme():
+    forwarded = request.headers.get("X-Forwarded-Proto", "").split(",")[0].strip()
+    return forwarded or request.scheme
+
+
+def current_request_host():
+    forwarded = request.headers.get("X-Forwarded-Host", "").split(",")[0].strip()
+    return forwarded or request.host
+
+
+def external_url_for(endpoint, **values):
+    if PANEL_PUBLIC_URL:
+        return f"{PANEL_PUBLIC_URL}{url_for(endpoint, **values)}"
+    return f"{current_request_scheme()}://{current_request_host()}{url_for(endpoint, **values)}"
+
+
+def parse_xray_client_profile():
+    if not XRAY_CLIENT_CONFIG_PATH.is_file():
+        return None, f"未找到 Xray 客户端配置：{XRAY_CLIENT_CONFIG_PATH}"
+
+    try:
+        payload = json.loads(XRAY_CLIENT_CONFIG_PATH.read_text(encoding="utf-8"))
+        outbounds = payload.get("outbounds", [])
+        if not isinstance(outbounds, list) or not outbounds:
+            raise ValueError("outbounds 为空")
+        outbound = next((item for item in outbounds if item.get("protocol") == "vless"), outbounds[0])
+        vnext = outbound["settings"]["vnext"][0]
+        user = vnext["users"][0]
+        reality = outbound["streamSettings"]["realitySettings"]
+        profile = {
+            "server": str(vnext["address"]).strip(),
+            "uuid": str(user["id"]).strip(),
+            "flow": str(user.get("flow", "")).strip(),
+            "server_name": str(reality["serverName"]).strip(),
+            "public_key": str(reality["publicKey"]).strip(),
+            "short_id": str(reality["shortId"]).strip(),
+            "fingerprint": str(reality.get("fingerprint", "chrome")).strip() or "chrome",
+        }
+    except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        return None, f"Xray 客户端配置解析失败：{exc}"
+
+    missing = [key for key, value in profile.items() if not value]
+    if missing:
+        return None, f"Xray 客户端配置缺少字段：{', '.join(missing)}"
+    return profile, ""
+
+
+def build_vless_share_link(profile, listen_port, note):
+    params = urlencode(
+        {
+            "encryption": "none",
+            "flow": profile["flow"],
+            "security": "reality",
+            "sni": profile["server_name"],
+            "fp": profile["fingerprint"],
+            "pbk": profile["public_key"],
+            "sid": profile["short_id"],
+            "type": "tcp",
+            "headerType": "none",
+        }
+    )
+    tag = quote(normalize_subscription_name(note, listen_port), safe="")
+    return f"vless://{profile['uuid']}@{profile['server']}:{int(listen_port)}?{params}#{tag}"
+
+
+def build_v2ray_subscription_content(profile, listen_port, note):
+    share_link = build_vless_share_link(profile, listen_port, note)
+    return base64.b64encode(f"{share_link}\n".encode("utf-8")).decode("ascii")
+
+
+def build_clash_subscription_content(profile, listen_port, note):
+    proxy_name = normalize_subscription_name(note, listen_port)
+    lines = [
+        "port: 7890",
+        "socks-port: 7891",
+        "allow-lan: true",
+        "mode: rule",
+        "log-level: info",
+        "ipv6: true",
+        "",
+        "dns:",
+        "  enable: true",
+        "  listen: 0.0.0.0:1053",
+        "  ipv6: true",
+        "  enhanced-mode: fake-ip",
+        "  nameserver:",
+        "    - https://dns.google/dns-query",
+        "    - https://1.1.1.1/dns-query",
+        "",
+        "proxies:",
+        f"  - name: {yaml_quote(proxy_name)}",
+        "    type: vless",
+        f"    server: {yaml_quote(profile['server'])}",
+        f"    port: {int(listen_port)}",
+        f"    uuid: {yaml_quote(profile['uuid'])}",
+        "    udp: true",
+        "    tls: true",
+        "    network: tcp",
+        f"    servername: {yaml_quote(profile['server_name'])}",
+        f"    flow: {yaml_quote(profile['flow'])}",
+        "    reality-opts:",
+        f"      public-key: {yaml_quote(profile['public_key'])}",
+        f"      short-id: {yaml_quote(profile['short_id'])}",
+        f"    client-fingerprint: {yaml_quote(profile['fingerprint'])}",
+        "",
+        "proxy-groups:",
+        "  - name: PROXY",
+        "    type: select",
+        "    proxies:",
+        f"      - {yaml_quote(proxy_name)}",
+        "      - DIRECT",
+        "",
+        "  - name: AUTO",
+        "    type: url-test",
+        "    url: http://www.gstatic.com/generate_204",
+        "    interval: 300",
+        "    proxies:",
+        f"      - {yaml_quote(proxy_name)}",
+        "",
+        "rule-providers:",
+        "  BanAD:",
+        "    type: http",
+        "    behavior: classical",
+        "    url: https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/BanAD.yaml",
+        "    path: ./ruleset/BanAD.yaml",
+        "    interval: 86400",
+        "",
+        "  BanEasyList:",
+        "    type: http",
+        "    behavior: classical",
+        "    url: https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/BanEasyList.yaml",
+        "    path: ./ruleset/BanEasyList.yaml",
+        "    interval: 86400",
+        "",
+        "  BanEasyListChina:",
+        "    type: http",
+        "    behavior: classical",
+        "    url: https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/BanEasyListChina.yaml",
+        "    path: ./ruleset/BanEasyListChina.yaml",
+        "    interval: 86400",
+        "",
+        "  BanEasyPrivacy:",
+        "    type: http",
+        "    behavior: classical",
+        "    url: https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/BanEasyPrivacy.yaml",
+        "    path: ./ruleset/BanEasyPrivacy.yaml",
+        "    interval: 86400",
+        "",
+        "  BanProgramAD:",
+        "    type: http",
+        "    behavior: classical",
+        "    url: https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/BanProgramAD.yaml",
+        "    path: ./ruleset/BanProgramAD.yaml",
+        "    interval: 86400",
+        "",
+        "  Download:",
+        "    type: http",
+        "    behavior: classical",
+        "    url: https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/Download.yaml",
+        "    path: ./ruleset/Download.yaml",
+        "    interval: 86400",
+        "",
+        "  LocalAreaNetwork:",
+        "    type: http",
+        "    behavior: classical",
+        "    url: https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/LocalAreaNetwork.yaml",
+        "    path: ./ruleset/LocalAreaNetwork.yaml",
+        "    interval: 86400",
+        "",
+        "  UnBan:",
+        "    type: http",
+        "    behavior: classical",
+        "    url: https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/UnBan.yaml",
+        "    path: ./ruleset/UnBan.yaml",
+        "    interval: 86400",
+        "",
+        "  ChinaDomain:",
+        "    type: http",
+        "    behavior: classical",
+        "    url: https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/ChinaDomain.yaml",
+        "    path: ./ruleset/ChinaDomain.yaml",
+        "    interval: 86400",
+        "",
+        "  ChinaCompanyIp:",
+        "    type: http",
+        "    behavior: classical",
+        "    url: https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/ChinaCompanyIp.yaml",
+        "    path: ./ruleset/ChinaCompanyIp.yaml",
+        "    interval: 86400",
+        "",
+        "  ChinaIp:",
+        "    type: http",
+        "    behavior: classical",
+        "    url: https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/ChinaIp.yaml",
+        "    path: ./ruleset/ChinaIp.yaml",
+        "    interval: 86400",
+        "",
+        "  ChinaMedia:",
+        "    type: http",
+        "    behavior: classical",
+        "    url: https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/ChinaMedia.yaml",
+        "    path: ./ruleset/ChinaMedia.yaml",
+        "    interval: 86400",
+        "",
+        "  ProxyGFWlist:",
+        "    type: http",
+        "    behavior: classical",
+        "    url: https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/ProxyGFWlist.yaml",
+        "    path: ./ruleset/ProxyGFWlist.yaml",
+        "    interval: 86400",
+        "",
+        "  ProxyMedia:",
+        "    type: http",
+        "    behavior: classical",
+        "    url: https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/ProxyMedia.yaml",
+        "    path: ./ruleset/ProxyMedia.yaml",
+        "    interval: 86400",
+        "",
+        "  Apple:",
+        "    type: http",
+        "    behavior: classical",
+        "    url: https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/Ruleset/Apple.yaml",
+        "    path: ./ruleset/Apple.yaml",
+        "    interval: 86400",
+        "",
+        "  Bilibili:",
+        "    type: http",
+        "    behavior: classical",
+        "    url: https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/Ruleset/Bilibili.yaml",
+        "    path: ./ruleset/Bilibili.yaml",
+        "    interval: 86400",
+        "",
+        "  BilibiliHMT:",
+        "    type: http",
+        "    behavior: classical",
+        "    url: https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/Ruleset/BilibiliHMT.yaml",
+        "    path: ./ruleset/BilibiliHMT.yaml",
+        "    interval: 86400",
+        "",
+        "  Google:",
+        "    type: http",
+        "    behavior: classical",
+        "    url: https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/Ruleset/Google.yaml",
+        "    path: ./ruleset/Google.yaml",
+        "    interval: 86400",
+        "",
+        "  GoogleCN:",
+        "    type: http",
+        "    behavior: classical",
+        "    url: https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/Ruleset/GoogleCN.yaml",
+        "    path: ./ruleset/GoogleCN.yaml",
+        "    interval: 86400",
+        "",
+        "  GoogleFCM:",
+        "    type: http",
+        "    behavior: classical",
+        "    url: https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/Ruleset/GoogleFCM.yaml",
+        "    path: ./ruleset/GoogleFCM.yaml",
+        "    interval: 86400",
+        "",
+        "  Microsoft:",
+        "    type: http",
+        "    behavior: classical",
+        "    url: https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/Ruleset/Microsoft.yaml",
+        "    path: ./ruleset/Microsoft.yaml",
+        "    interval: 86400",
+        "",
+        "  NetEaseMusic:",
+        "    type: http",
+        "    behavior: classical",
+        "    url: https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/Ruleset/NetEaseMusic.yaml",
+        "    path: ./ruleset/NetEaseMusic.yaml",
+        "    interval: 86400",
+        "",
+        "  Netflix:",
+        "    type: http",
+        "    behavior: classical",
+        "    url: https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/Ruleset/Netflix.yaml",
+        "    path: ./ruleset/Netflix.yaml",
+        "    interval: 86400",
+        "",
+        "  OneDrive:",
+        "    type: http",
+        "    behavior: classical",
+        "    url: https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/Ruleset/OneDrive.yaml",
+        "    path: ./ruleset/OneDrive.yaml",
+        "    interval: 86400",
+        "",
+        "  Spotify:",
+        "    type: http",
+        "    behavior: classical",
+        "    url: https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/Ruleset/Spotify.yaml",
+        "    path: ./ruleset/Spotify.yaml",
+        "    interval: 86400",
+        "",
+        "  Steam:",
+        "    type: http",
+        "    behavior: classical",
+        "    url: https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/Ruleset/Steam.yaml",
+        "    path: ./ruleset/Steam.yaml",
+        "    interval: 86400",
+        "",
+        "  SteamCN:",
+        "    type: http",
+        "    behavior: classical",
+        "    url: https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/Ruleset/SteamCN.yaml",
+        "    path: ./ruleset/SteamCN.yaml",
+        "    interval: 86400",
+        "",
+        "  Telegram:",
+        "    type: http",
+        "    behavior: classical",
+        "    url: https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/Ruleset/Telegram.yaml",
+        "    path: ./ruleset/Telegram.yaml",
+        "    interval: 86400",
+        "",
+        "  YouTube:",
+        "    type: http",
+        "    behavior: classical",
+        "    url: https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/Providers/Ruleset/YouTube.yaml",
+        "    path: ./ruleset/YouTube.yaml",
+        "    interval: 86400",
+        "",
+        "rules:",
+        "  - RULE-SET,Download,DIRECT",
+        "  - RULE-SET,LocalAreaNetwork,DIRECT",
+        "  - RULE-SET,BanAD,REJECT",
+        "  - RULE-SET,BanEasyList,REJECT",
+        "  - RULE-SET,BanEasyListChina,REJECT",
+        "  - RULE-SET,BanEasyPrivacy,REJECT",
+        "  - RULE-SET,BanProgramAD,REJECT",
+        "  - DOMAIN-SUFFIX,cn,DIRECT",
+        "  - RULE-SET,ChinaCompanyIp,DIRECT",
+        "  - RULE-SET,ChinaDomain,DIRECT",
+        "  - RULE-SET,ChinaIp,DIRECT",
+        "  - RULE-SET,SteamCN,DIRECT",
+        "  - RULE-SET,ProxyGFWlist,PROXY",
+        "  - RULE-SET,Telegram,PROXY",
+        "  - RULE-SET,UnBan,DIRECT",
+        "  - RULE-SET,ChinaMedia,DIRECT",
+        "  - RULE-SET,ProxyMedia,PROXY",
+        "  - RULE-SET,Bilibili,DIRECT",
+        "  - RULE-SET,BilibiliHMT,PROXY",
+        "  - RULE-SET,NetEaseMusic,DIRECT",
+        "  - RULE-SET,GoogleCN,DIRECT",
+        "  - RULE-SET,GoogleFCM,PROXY",
+        "  - RULE-SET,Google,PROXY",
+        "  - RULE-SET,Apple,PROXY",
+        "  - RULE-SET,Microsoft,PROXY",
+        "  - RULE-SET,OneDrive,PROXY",
+        "  - RULE-SET,Netflix,PROXY",
+        "  - RULE-SET,Spotify,PROXY",
+        "  - RULE-SET,Steam,PROXY",
+        "  - RULE-SET,YouTube,PROXY",
+        "  - GEOIP,CN,DIRECT",
+        "  - MATCH,PROXY",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def status_payload(enabled, expires_at, traffic_limit_bytes=None, traffic_usage_bytes=0):
     expired = False
     if expires_at:
@@ -283,6 +657,43 @@ class PanelState:
                     checked_at TEXT NOT NULL,
                     failure_reason TEXT NOT NULL DEFAULT ''
                 );
+
+                CREATE TABLE IF NOT EXISTS ai_domains (
+                    domain TEXT PRIMARY KEY,
+                    classification TEXT NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL DEFAULT '',
+                    model TEXT NOT NULL DEFAULT '',
+                    first_seen TEXT,
+                    last_seen TEXT,
+                    total_hits INTEGER NOT NULL DEFAULT 0,
+                    last_protocols TEXT NOT NULL DEFAULT '[]',
+                    last_report_window_start TEXT,
+                    last_report_window_end TEXT,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS ai_domain_observations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    domain TEXT NOT NULL,
+                    window_start TEXT NOT NULL,
+                    window_end TEXT NOT NULL,
+                    hits INTEGER NOT NULL,
+                    classification TEXT NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL DEFAULT '',
+                    model TEXT NOT NULL DEFAULT '',
+                    protocols TEXT NOT NULL DEFAULT '[]',
+                    first_seen TEXT,
+                    last_seen TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_domain_observations_window
+                ON ai_domain_observations(domain, window_start, window_end);
+
+                CREATE INDEX IF NOT EXISTS idx_ai_domain_observations_domain
+                ON ai_domain_observations(domain);
                 """
             )
             self.ensure_port_schema(conn)
@@ -294,6 +705,31 @@ class PanelState:
         }
         if "traffic_limit_bytes" not in columns:
             conn.execute("ALTER TABLE ports ADD COLUMN traffic_limit_bytes INTEGER")
+
+    def ensure_subscription_token_in_tx(self, conn):
+        token = str(self.get_state(conn, "subscription_token", "") or "").strip()
+        if token:
+            return token
+        token = generate_subscription_token()
+        self.set_state(conn, "subscription_token", token)
+        return token
+
+    def normalize_upstream_targets(self):
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE ports
+                SET upstream_host = ?, upstream_port = ?
+                WHERE upstream_host != ? OR upstream_port != ?
+                """,
+                (
+                    DEFAULT_UPSTREAM_HOST,
+                    DEFAULT_UPSTREAM_PORT,
+                    DEFAULT_UPSTREAM_HOST,
+                    DEFAULT_UPSTREAM_PORT,
+                ),
+            )
+            conn.commit()
 
     def seed_defaults(self):
         if not SEED_LISTEN_PORT:
@@ -323,6 +759,11 @@ class PanelState:
     def bootstrap(self):
         self.init_db()
         self.seed_defaults()
+        self.normalize_upstream_targets()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self.ensure_subscription_token_in_tx(conn)
+            conn.commit()
         self.sync_traffic_logs()
         self.disable_auto_stopped_ports(reload_nginx=False)
         self.write_current_config()
@@ -515,6 +956,59 @@ class PanelState:
             ports.append(item)
         return ports
 
+    def get_subscription_token(self):
+        with self.write_lock:
+            with self.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                token = self.ensure_subscription_token_in_tx(conn)
+                conn.commit()
+                return token
+
+    def rotate_subscription_token(self):
+        with self.write_lock:
+            with self.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                token = generate_subscription_token()
+                self.set_state(conn, "subscription_token", token)
+                conn.commit()
+                return token
+
+    def get_port_subscription_record(self, listen_port):
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    p.id,
+                    p.listen_port,
+                    p.note,
+                    p.enabled,
+                    p.expires_at,
+                    p.traffic_limit_bytes,
+                    COALESCE(t.total_bytes_sent, 0) AS total_bytes_sent,
+                    COALESCE(t.total_bytes_received, 0) AS total_bytes_received
+                FROM ports p
+                LEFT JOIN traffic_totals t ON t.listen_port = p.listen_port
+                WHERE p.listen_port = ?
+                LIMIT 1
+                """,
+                (listen_port,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        item = dict(row)
+        item["traffic_usage_bytes"] = int(item["total_bytes_sent"]) + int(item["total_bytes_received"])
+        status = status_payload(
+            bool(item["enabled"]),
+            item["expires_at"],
+            item["traffic_limit_bytes"],
+            item["traffic_usage_bytes"],
+        )
+        item["status"] = status["code"]
+        item["status_label"] = status["label"]
+        return item
+
     def query_summary(self, ports):
         summary = {
             "total_ports": len(ports),
@@ -543,8 +1037,8 @@ class PanelState:
     def validate_port_payload(self, form):
         return {
             "listen_port": parse_port(form.get("listen_port"), "监听端口"),
-            "upstream_host": parse_host(form.get("upstream_host")),
-            "upstream_port": parse_port(form.get("upstream_port"), "目标端口"),
+            "upstream_host": DEFAULT_UPSTREAM_HOST,
+            "upstream_port": DEFAULT_UPSTREAM_PORT,
             "expires_at": parse_expiry(form.get("expires_at")),
             "traffic_limit_bytes": parse_data_size(form.get("traffic_limit"), "流量上限"),
             "note": parse_note(form.get("note")),
@@ -1104,6 +1598,8 @@ state = PanelState()
 def ensure_basic_auth():
     if request.path == "/healthz":
         return None
+    if request.endpoint in {"subscription_default", "subscription_clash", "subscription_v2ray"}:
+        return None
     if not AUTH_ENABLED:
         return None
     auth = request.authorization
@@ -1133,6 +1629,35 @@ def index():
     state.disable_auto_stopped_ports(reload_nginx=True)
     ports = state.query_ports()
     summary = state.query_summary(ports)
+    subscription_profile, subscription_error = parse_xray_client_profile()
+    subscription = {
+        "available": subscription_profile is not None,
+        "error": subscription_error,
+        "token": "",
+        "client_config_path": str(XRAY_CLIENT_CONFIG_PATH),
+        "server": subscription_profile["server"] if subscription_profile else "",
+    }
+    if subscription_profile is not None:
+        subscription["token"] = state.get_subscription_token()
+        for port in ports:
+            port["subscription"] = {
+                "clash_url": external_url_for(
+                    "subscription_clash",
+                    token=subscription["token"],
+                    listen_port=port["listen_port"],
+                ),
+                "v2ray_url": external_url_for(
+                    "subscription_v2ray",
+                    token=subscription["token"],
+                    listen_port=port["listen_port"],
+                ),
+                "default_url": external_url_for(
+                    "subscription_default",
+                    token=subscription["token"],
+                    listen_port=port["listen_port"],
+                ),
+                "share_link": build_vless_share_link(subscription_profile, port["listen_port"], port["note"]),
+            }
     return render_template(
         "index.html",
         ports=ports,
@@ -1145,7 +1670,9 @@ def index():
         nginx_running=state.nginx_running(),
         panel_host=PANEL_HOST,
         panel_port=PANEL_PORT,
+        panel_public_url=(f"{PANEL_PUBLIC_URL}/" if PANEL_PUBLIC_URL else ""),
         probe_enabled=PROBE_ENABLED,
+        subscription=subscription,
     )
 
 
@@ -1162,6 +1689,7 @@ def probe_dashboard():
         nginx_running=state.nginx_running(),
         panel_host=PANEL_HOST,
         panel_port=PANEL_PORT,
+        panel_public_url=(f"{PANEL_PUBLIC_URL}/" if PANEL_PUBLIC_URL else ""),
     )
 
 
@@ -1171,6 +1699,50 @@ def healthz():
     healthy = state.nginx_running()
     status_code = 200 if healthy else 500
     return jsonify({"ok": healthy, "nginx_running": healthy}), status_code
+
+
+def build_subscription_response(token, listen_port, output_format):
+    expected_token = state.get_subscription_token()
+    if token != expected_token:
+        abort(404)
+
+    profile, _ = parse_xray_client_profile()
+    if profile is None:
+        abort(404)
+
+    port = state.get_port_subscription_record(listen_port)
+    if port is None:
+        abort(404)
+
+    if output_format == "v2ray":
+        content = build_v2ray_subscription_content(profile, listen_port, port["note"])
+        content_type = "text/plain; charset=utf-8"
+    else:
+        content = build_clash_subscription_content(profile, listen_port, port["note"])
+        content_type = "text/yaml; charset=utf-8"
+
+    return Response(content, content_type=content_type)
+
+
+@app.route("/subscriptions/rotate", methods=["POST"])
+def rotate_subscription():
+    state.rotate_subscription_token()
+    return message_redirect("订阅链接已重新生成，旧链接已失效。", "success")
+
+
+@app.route("/<token>/<int:listen_port>", methods=["GET"])
+def subscription_default(token, listen_port):
+    return build_subscription_response(token, listen_port, "clash")
+
+
+@app.route("/<token>/<int:listen_port>/clash", methods=["GET"])
+def subscription_clash(token, listen_port):
+    return build_subscription_response(token, listen_port, "clash")
+
+
+@app.route("/<token>/<int:listen_port>/v2ray", methods=["GET"])
+def subscription_v2ray(token, listen_port):
+    return build_subscription_response(token, listen_port, "v2ray")
 
 
 @app.route("/ports/create", methods=["POST"])
