@@ -4,4 +4,6 @@ RUN apk add --no-cache ca-certificates docker-cli nodejs
 
 WORKDIR /workspace
 
+COPY . /workspace
+
 CMD ["python", "/workspace/scripts/ai_domain_manager.py"]

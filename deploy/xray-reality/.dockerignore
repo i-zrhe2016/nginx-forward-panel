@@ -1,0 +1,10 @@
+.env
+ai-proxy-outbound.json
+__pycache__/
+*.py[cod]
+logs/*
+!logs/.gitkeep
+reports/*
+!reports/.gitkeep
+runtime/*
+!runtime/.gitkeep

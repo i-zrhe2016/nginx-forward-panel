@@ -70,6 +70,38 @@ def validate_env(values: dict[str, str]) -> None:
         raise ValueError("XRAY_DEST must look like host:port")
 
 
+def env_bool(values: dict[str, str], key: str, default: bool) -> bool:
+    raw = str(values.get(key, "1" if default else "0")).strip().lower()
+    return raw not in {"0", "false", "no", "off", ""}
+
+
+def env_nonnegative_int(values: dict[str, str], key: str, default: int) -> int:
+    raw = str(values.get(key, default)).strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{key} must be a non-negative integer") from exc
+    if value < 0:
+        raise ValueError(f"{key} must be a non-negative integer")
+    return value
+
+
+def build_stream_sockopt(values: dict[str, str]) -> dict:
+    sockopt: dict[str, object] = {}
+    if env_bool(values, "XRAY_TCP_FAST_OPEN", True):
+        sockopt["tcpFastOpen"] = True
+
+    keepalive_idle = env_nonnegative_int(values, "XRAY_TCP_KEEPALIVE_IDLE", 180)
+    if keepalive_idle > 0:
+        sockopt["tcpKeepAliveIdle"] = keepalive_idle
+
+    keepalive_interval = env_nonnegative_int(values, "XRAY_TCP_KEEPALIVE_INTERVAL", 30)
+    if keepalive_interval > 0:
+        sockopt["tcpKeepAliveInterval"] = keepalive_interval
+
+    return sockopt
+
+
 def load_optional_json(path: Path | None) -> dict | None:
     if path is None or not path.is_file():
         return None
@@ -110,6 +142,7 @@ def merge_dynamic_routing(config: dict, dynamic_payload: dict | None) -> dict:
 
 
 def build_server_config(values: dict[str, str], dynamic_payload: dict | None = None) -> dict:
+    stream_sockopt = build_stream_sockopt(values)
     config = {
         "log": {
             "loglevel": values["XRAY_LOGLEVEL"],
@@ -133,6 +166,7 @@ def build_server_config(values: dict[str, str], dynamic_payload: dict | None = N
                 "streamSettings": {
                     "network": "tcp",
                     "security": "reality",
+                    "sockopt": stream_sockopt,
                     "realitySettings": {
                         "show": False,
                         "dest": values["XRAY_DEST"],
@@ -163,6 +197,7 @@ def resolve_public_port(values: dict[str, str]) -> int:
 
 def build_client_config(values: dict[str, str]) -> dict:
     public_port = resolve_public_port(values)
+    stream_sockopt = build_stream_sockopt(values)
     return {
         "log": {"loglevel": "warning"},
         "inbounds": [
@@ -194,6 +229,7 @@ def build_client_config(values: dict[str, str]) -> dict:
                 "streamSettings": {
                     "network": "tcp",
                     "security": "reality",
+                    "sockopt": stream_sockopt,
                     "realitySettings": {
                         "serverName": values["XRAY_SERVER_NAME"],
                         "fingerprint": values["XRAY_FINGERPRINT"],

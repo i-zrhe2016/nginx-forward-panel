@@ -1,0 +1,207 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: nginx-forward-panel
+  namespace: nginx-forward-panel
+spec:
+  serviceName: nginx-forward-panel-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nginx-forward-panel
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nginx-forward-panel
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      shareProcessNamespace: true
+      terminationGracePeriodSeconds: 30
+      nodeSelector:
+        nginx-forward-panel/edge: "true"
+      initContainers:
+        - name: init-workspace
+          image: busybox:1.36
+          command:
+            - sh
+            - -lc
+            - |
+              mkdir -p /xray-workspace/runtime
+              mkdir -p /xray-workspace/logs
+              mkdir -p /xray-workspace/reports/hourly-domains
+          volumeMounts:
+            - name: xray-workspace
+              mountPath: /xray-workspace
+        - name: render-xray-config
+          image: ghcr.io/your-org/nginx-forward-panel-ai-manager:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -lc
+            - |
+              python /workspace/scripts/render_config.py \
+                --env-file /workspace/.env \
+                --config-out /workspace/runtime/config.json \
+                --client-out /workspace/runtime/client-test.json \
+                --share-out /workspace/runtime/client-share.txt \
+                --dynamic-routing-file /workspace/runtime/dynamic-routing.json
+          volumeMounts:
+            - name: xray-workspace
+              mountPath: /workspace/runtime
+              subPath: runtime
+            - name: xray-workspace
+              mountPath: /workspace/logs
+              subPath: logs
+            - name: xray-workspace
+              mountPath: /workspace/reports
+              subPath: reports
+            - name: runtime-secret
+              mountPath: /workspace/.env
+              subPath: .env
+              readOnly: true
+            - name: runtime-secret
+              mountPath: /workspace/ai-proxy-outbound.json
+              subPath: ai-proxy-outbound.json
+              readOnly: true
+      containers:
+        - name: nginx-forward-panel
+          image: ghcr.io/your-org/nginx-forward-panel:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: nginx-forward-panel-config
+          ports:
+            - name: panel-http
+              containerPort: 18080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 18080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 18080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: panel-data
+              mountPath: /data
+            - name: panel-logs
+              mountPath: /var/log/nginx
+            - name: xray-workspace
+              mountPath: /xray-runtime
+              subPath: runtime
+              readOnly: true
+        - name: xray-reality
+          image: ghcr.io/xtls/xray-core:26.5.3
+          imagePullPolicy: IfNotPresent
+          command:
+            - /usr/local/bin/xray
+            - run
+            - -c
+            - /xray-runtime/config.json
+          ports:
+            - name: reality
+              containerPort: 443
+              protocol: TCP
+          readinessProbe:
+            exec:
+              command:
+                - /usr/local/bin/xray
+                - run
+                - -test
+                - -config
+                - /xray-runtime/config.json
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          livenessProbe:
+            exec:
+              command:
+                - /usr/local/bin/xray
+                - run
+                - -test
+                - -config
+                - /xray-runtime/config.json
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 1
+              memory: 512Mi
+          volumeMounts:
+            - name: xray-workspace
+              mountPath: /xray-runtime
+              subPath: runtime
+            - name: xray-workspace
+              mountPath: /var/log/xray
+              subPath: logs
+        - name: xray-ai-domain-manager
+          image: ghcr.io/your-org/nginx-forward-panel-ai-manager:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - python
+            - /workspace/scripts/ai_domain_manager.py
+          envFrom:
+            - configMapRef:
+                name: nginx-forward-panel-config
+          env:
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nginx-forward-panel-runtime
+                  key: OPENAI_API_KEY
+            - name: DOCKER_TIMEOUT_SECONDS
+              value: "30"
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 1
+              memory: 1Gi
+          volumeMounts:
+            - name: panel-data
+              mountPath: /panel-data
+            - name: xray-workspace
+              mountPath: /workspace/runtime
+              subPath: runtime
+            - name: xray-workspace
+              mountPath: /workspace/logs
+              subPath: logs
+            - name: xray-workspace
+              mountPath: /workspace/reports
+              subPath: reports
+            - name: runtime-secret
+              mountPath: /workspace/.env
+              subPath: .env
+              readOnly: true
+            - name: runtime-secret
+              mountPath: /workspace/ai-proxy-outbound.json
+              subPath: ai-proxy-outbound.json
+              readOnly: true
+      volumes:
+        - name: panel-data
+          persistentVolumeClaim:
+            claimName: panel-data-pvc
+        - name: panel-logs
+          persistentVolumeClaim:
+            claimName: panel-logs-pvc
+        - name: xray-workspace
+          persistentVolumeClaim:
+            claimName: xray-workspace-pvc
+        - name: runtime-secret
+          secret:
+            secretName: nginx-forward-panel-runtime

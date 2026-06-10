@@ -781,6 +781,46 @@ def join_host_port(host, port):
     return f"{host_text}:{int(port)}"
 
 
+def build_proxy_sockopt_payload():
+    sockopt = {}
+    if env_bool("XRAY_TCP_FAST_OPEN", True):
+        sockopt["tcpFastOpen"] = True
+
+    keepalive_idle = env_int("XRAY_TCP_KEEPALIVE_IDLE", 180)
+    if keepalive_idle > 0:
+        sockopt["tcpKeepAliveIdle"] = keepalive_idle
+
+    keepalive_interval = env_int("XRAY_TCP_KEEPALIVE_INTERVAL", 30)
+    if keepalive_interval > 0:
+        sockopt["tcpKeepAliveInterval"] = keepalive_interval
+
+    return sockopt
+
+
+def apply_default_proxy_sockopt(outbounds):
+    default_sockopt = build_proxy_sockopt_payload()
+    if not default_sockopt:
+        return
+
+    for outbound in outbounds:
+        if not isinstance(outbound, dict):
+            continue
+        stream_settings = outbound.get("streamSettings")
+        if not isinstance(stream_settings, dict):
+            continue
+        network = str(stream_settings.get("network", "tcp")).strip().lower()
+        if network and network != "tcp":
+            continue
+
+        existing = stream_settings.get("sockopt", {})
+        if not isinstance(existing, dict):
+            existing = {}
+        merged = dict(existing)
+        for key, value in default_sockopt.items():
+            merged.setdefault(key, value)
+        stream_settings["sockopt"] = merged
+
+
 def build_default_proxy_payload(ai_target):
     return {
         "outbounds": [
@@ -838,6 +878,7 @@ def render_proxy_template(template_path, ai_target, panel_target):
         return None, "proxy_template_protocol_placeholder_not_replaced"
     if str(first.get("tag", "")).strip() != "ai_proxy":
         first["tag"] = "ai_proxy"
+    apply_default_proxy_sockopt(outbounds)
     return {"outbounds": outbounds}, ""
 
 
@@ -1010,6 +1051,22 @@ def restart_xray_container(container_name, timeout_seconds):
         raise RuntimeError(detail)
 
 
+def restart_xray_command(command, timeout_seconds):
+    if not command:
+        return
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=timeout_seconds,
+        shell=True,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip() or "restart command failed"
+        raise RuntimeError(detail)
+
+
 def classify_pending_domains(decisions, decisions_path, observed_domains, args):
     known = set(decisions["domains"])
     pending = sorted(domain for domain in observed_domains if domain not in known)
@@ -1143,8 +1200,11 @@ def run_once(args):
     )
     current_config = args.config_out.read_text(encoding="utf-8") if args.config_out.is_file() else ""
     config_changed = current_config != previous_config
-    if config_changed and args.restart_container_name:
-        restart_xray_container(args.restart_container_name, args.docker_timeout_seconds)
+    if config_changed:
+        if args.restart_command:
+            restart_xray_command(args.restart_command, args.docker_timeout_seconds)
+        elif args.restart_container_name:
+            restart_xray_container(args.restart_container_name, args.docker_timeout_seconds)
 
     report = build_domain_report(log_state, cutoff, now, decisions, ai_target, panel_target, route_status)
     if pending_without_classifier:
@@ -1201,6 +1261,7 @@ def build_args():
         os.environ.get("AI_PROXY_OUTBOUND_TEMPLATE_PATH", str(workspace / "ai-proxy-outbound.json"))
     )
     args.restart_container_name = os.environ.get("XRAY_RESTART_CONTAINER", "").strip()
+    args.restart_command = os.environ.get("XRAY_RESTART_COMMAND", "").strip()
     args.codex_classifier_enabled = env_bool("CODEX_CLASSIFIER_ENABLED", "1")
     args.codex_source_home = Path(os.environ.get("CODEX_SOURCE_HOME", "/host-codex-home"))
     args.codex_runtime_home = Path(

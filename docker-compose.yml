@@ -6,6 +6,10 @@ services:
     container_name: nginx-forward-panel
     restart: unless-stopped
     network_mode: host
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     environment:
       PANEL_PORT: "18080"
       PANEL_PUBLIC_URL: "http://64.186.224.96:18080"
@@ -49,6 +53,10 @@ services:
     user: "0:0"
     restart: unless-stopped
     network_mode: host
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     command: ["run", "-c", "/etc/xray/config.json"]
     volumes:
       - ./deploy/xray-reality/runtime/config.json:/etc/xray/config.json:ro

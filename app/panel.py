@@ -32,6 +32,21 @@ def parse_optional_env_port(value, field_name):
     return port
 
 
+def parse_nonnegative_env_int(value, field_name):
+    try:
+        number = int(str(value).strip())
+    except ValueError as exc:
+        raise ValueError(f"{field_name} 必须是非负整数。") from exc
+    if number < 0:
+        raise ValueError(f"{field_name} 必须是非负整数。")
+    return number
+
+
+def parse_bool_env(value, default=False):
+    raw = str(value if value is not None else ("1" if default else "0")).strip().lower()
+    return raw not in {"0", "false", "no", "off", ""}
+
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 DB_PATH = Path(os.environ.get("DB_PATH", DATA_DIR / "panel.db"))
@@ -54,6 +69,19 @@ DEFAULT_UPSTREAM_PORT = int(os.environ.get("DEFAULT_UPSTREAM_PORT", "443"))
 SEED_LISTEN_PORT = os.environ.get("SEED_LISTEN_PORT", "31098").strip()
 PROXY_CONNECT_TIMEOUT = os.environ.get("PROXY_CONNECT_TIMEOUT", "5s")
 PROXY_TIMEOUT = os.environ.get("PROXY_TIMEOUT", "600s")
+STREAM_LISTEN_BACKLOG = parse_nonnegative_env_int(
+    os.environ.get("STREAM_LISTEN_BACKLOG", "4096"),
+    "STREAM_LISTEN_BACKLOG",
+)
+STREAM_LISTEN_FASTOPEN = parse_nonnegative_env_int(
+    os.environ.get("STREAM_LISTEN_FASTOPEN", "256"),
+    "STREAM_LISTEN_FASTOPEN",
+)
+STREAM_LISTEN_SO_KEEPALIVE = os.environ.get("STREAM_LISTEN_SO_KEEPALIVE", "on").strip() or "on"
+STREAM_PROXY_SOCKET_KEEPALIVE = parse_bool_env(
+    os.environ.get("STREAM_PROXY_SOCKET_KEEPALIVE", "1"),
+    default=True,
+)
 MAINTENANCE_INTERVAL = int(os.environ.get("MAINTENANCE_INTERVAL", "10"))
 PROBE_ENABLED = os.environ.get("PROBE_ENABLED", "0").strip().lower() not in {"0", "false", "no", "off"}
 PROBE_INTERVAL = int(os.environ.get("PROBE_INTERVAL", "60"))
@@ -1515,18 +1543,26 @@ class PanelState:
             "",
         ]
         for row in rows:
+            listen_options = [str(row["listen_port"]), "reuseport"]
+            if STREAM_LISTEN_BACKLOG > 0:
+                listen_options.append(f"backlog={STREAM_LISTEN_BACKLOG}")
+            if STREAM_LISTEN_FASTOPEN > 0:
+                listen_options.append(f"fastopen={STREAM_LISTEN_FASTOPEN}")
+            if STREAM_LISTEN_SO_KEEPALIVE:
+                listen_options.append(f"so_keepalive={STREAM_LISTEN_SO_KEEPALIVE}")
             blocks.extend(
                 [
                     "server {",
-                    f"    listen {row['listen_port']} reuseport;",
+                    f"    listen {' '.join(listen_options)};",
                     f"    proxy_connect_timeout {PROXY_CONNECT_TIMEOUT};",
                     f"    proxy_timeout {PROXY_TIMEOUT};",
+                    "    proxy_socket_keepalive on;" if STREAM_PROXY_SOCKET_KEEPALIVE else "",
                     f"    proxy_pass {row['upstream_host']}:{row['upstream_port']};",
                     "}",
                     "",
                 ]
             )
-        return "\n".join(blocks).strip() + "\n"
+        return "\n".join(line for line in blocks if line).strip() + "\n"
 
     def write_current_config(self):
         with self.connect() as conn:

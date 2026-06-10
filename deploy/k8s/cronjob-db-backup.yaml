@@ -1,0 +1,51 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nginx-forward-panel-db-backup
+  namespace: nginx-forward-panel
+spec:
+  schedule: "0 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          nodeSelector:
+            nginx-forward-panel/edge: "true"
+          containers:
+            - name: backup
+              image: ghcr.io/your-org/nginx-forward-panel:latest
+              imagePullPolicy: IfNotPresent
+              command:
+                - python3
+                - /app/scripts/backup_db.py
+                - --db-path
+                - /data/panel.db
+                - --backup-dir
+                - /backups
+                - --keep-days
+                - "7"
+                - --prefix
+                - nginx-forward-panel
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  cpu: 200m
+                  memory: 256Mi
+              volumeMounts:
+                - name: panel-data
+                  mountPath: /data
+                - name: panel-backups
+                  mountPath: /backups
+          volumes:
+            - name: panel-data
+              persistentVolumeClaim:
+                claimName: panel-data-pvc
+            - name: panel-backups
+              persistentVolumeClaim:
+                claimName: panel-backups-pvc
